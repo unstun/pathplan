@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .common import heading_diff
-from .geometry import path_collides
+from .geometry import GridFootprintChecker
 from .heuristics import admissible_heuristic
 from .primitives import MotionPrimitive, default_primitives, primitive_cost
 from .robot import AckermannParams, AckermannState, sample_constant_steer_motion
@@ -47,6 +47,7 @@ class HybridAStarPlanner:
         self.collision_step = collision_step
         self.goal_xy_tol = goal_xy_tol
         self.goal_theta_tol = goal_theta_tol
+        self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
     def _discretize(self, state: AckermannState) -> Tuple[int, int, int]:
         gx, gy = self.map.world_to_grid(state.x, state.y)
@@ -104,7 +105,7 @@ class HybridAStarPlanner:
                     footprint=None,
                 )
                 nxt = arc_states[-1]
-                if path_collides(self.map, self.footprint, [s.as_tuple() for s in arc_states], sample_step=self.collision_step):
+                if self.collision_checker.collides_path(arc_states):
                     continue
                 g_new = current.g + primitive_cost(prim)
                 if current.action and prim.direction != current.action.direction:

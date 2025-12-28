@@ -28,13 +28,39 @@ try:
 except ImportError:
     plt = None
 
+# Shared defaults used by both the planner and the interactive editor.
+DEFAULT_START = AckermannState(5.0, 5.0, 0.0)
+DEFAULT_GOAL = AckermannState(75.0, 43.0, 0.0)
+FOREST_MAP_KWARGS = dict(
+    resolution=0.10,
+    size=(80.0, 48.0),
+    num_trees=400,  # dense but still navigable
+    tree_radius=0.30,
+    clearance=1.8,
+    seed=13,
+    keep_clear=[(DEFAULT_START.x, DEFAULT_START.y), (DEFAULT_GOAL.x, DEFAULT_GOAL.y)],
+    carve_points=None,
+    wall_y=None,
+    wall_gap=(7.0, 4.0),
+    wall_radius=0.10,
+    protected_path=None,
+)
+
+# Planner budgets tuned for the dense forest benchmark.
+HYBRID_TIMEOUT = 300.0  # give classic Hybrid A* more wall-clock time before declaring failure
+HYBRID_MAX_NODES = 400_000
+RL_TIMEOUT = 120.0
+RL_MAX_NODES = 200_000
+RRT_TIMEOUT = 60.0
+RRT_MAX_ITER = 60_000
+
 
 def make_forest_map(
     resolution: float = 0.05,
     size: tuple = (20.0, 12.0),
-    num_trees: int = 25,
-    tree_radius: float = 0.35,
-    clearance: float = 1.8,
+    num_trees: int = 10,
+    tree_radius: float = 1,
+    clearance: float = 100,
     seed: int = 13,
     keep_clear: Optional[List[Tuple[float, float]]] = None,
     carve_points: Optional[List[Tuple[float, float]]] = None,
@@ -57,8 +83,14 @@ def make_forest_map(
     rng = np.random.default_rng(seed)
     centers = []
     min_spacing = tree_radius * 2.0 + clearance
-    max_attempts = num_trees * 50
+    max_attempts = num_trees * 300  # larger scenes / larger clearance need more sampling attempts
     margin = max(tree_radius + 0.3, tree_radius + clearance * 0.25)
+    if margin * 2.0 >= min(size):
+        raise ValueError(
+            f"Map too small for tree_radius={tree_radius} and clearance={clearance}. "
+            f"Margin={margin:.2f} must be < half of map dimensions {size}. "
+            "Reduce clearance/tree_radius or increase map size."
+        )
 
     def dist_point_to_segment(p, a, b):
         ap = p - a
@@ -163,7 +195,7 @@ def plot_with_boxes(
 ):
     if plt is None or not planner_results:
         return None
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(24, 14))
     h, w = grid_map.data.shape
     extent = [
         grid_map.origin[0],
@@ -208,58 +240,32 @@ def plot_with_boxes(
     ax.legend(loc="upper right")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "dense_forest_no_slope_many_trees.png"
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
 
 def plan_forest_scene():
     output_dir = Path(__file__).resolve().parent / "outputs"
-    start = AckermannState(2.0, 2.0, 0.0)
-    goal = AckermannState(18.0, 10.0, 0.0)
-    grid_map = make_forest_map(
-        resolution=0.05,
-        size=(20.0, 12.0),
-        num_trees=25,
-        tree_radius=0.35,
-        clearance=1.8,
-        seed=13,
-        keep_clear=[(start.x, start.y), (goal.x, goal.y)],
-        carve_points=[
-            (start.x, start.y),
-            (4.0, 4.0),
-            (7.5, 6.0),
-            (11.0, 7.5),
-            (14.5, 8.8),
-            (goal.x, goal.y),
-        ],
-        carve_width=6.0,
-        wall_y=None,
-        wall_gap=(7.0, 4.0),
-        wall_radius=0.10,
-        protected_path=[
-            (start.x, start.y),
-            (4.0, 4.0),
-            (7.5, 6.0),
-            (11.0, 7.5),
-            (14.5, 8.8),
-            (goal.x, goal.y),
-        ],
-        protected_width=6.0,
-    )
+    start = DEFAULT_START
+    goal = DEFAULT_GOAL
+    map_kwargs = dict(FOREST_MAP_KWARGS)
+    map_kwargs["keep_clear"] = [(start.x, start.y), (goal.x, goal.y)]
+    grid_map = make_forest_map(**map_kwargs)
 
     params = AckermannParams()
     footprint = OrientedBoxFootprint(length=0.924, width=0.740)
-    short_primitives = default_primitives(params, step_length=0.5)
-    planner_kwargs = dict(
-        xy_resolution=0.25,
-        collision_step=0.15,
-        goal_xy_tol=1.0,
+    short_primitives = default_primitives(params, step_length=0.6)
+    base_kwargs = dict(
+        xy_resolution=0.35,
+        collision_step=0.10,
+        goal_xy_tol=1.5,
         goal_theta_tol=math.pi,
     )
+    rl_kwargs = dict(base_kwargs, rl_top_k=5)
     planners = [
-        ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **planner_kwargs)),
-        ("RL-guided Hybrid A*", RLGuidedHybridPlanner(grid_map, footprint, params, primitives=short_primitives, **planner_kwargs)),
+        ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **base_kwargs)),
+        ("RL-guided Hybrid A*", RLGuidedHybridPlanner(grid_map, footprint, params, primitives=short_primitives, **rl_kwargs)),
         ("RRT*", RRTStarPlanner(grid_map, footprint, params)),
     ]
 
@@ -267,9 +273,11 @@ def plan_forest_scene():
     for label, planner in planners:
         t0 = time.time()
         if isinstance(planner, RRTStarPlanner):
-            path, stats = planner.plan(start, goal, max_iter=12000, timeout=20.0)
+            path, stats = planner.plan(start, goal, max_iter=RRT_MAX_ITER, timeout=RRT_TIMEOUT)
+        elif isinstance(planner, HybridAStarPlanner):
+            path, stats = planner.plan(start, goal, timeout=HYBRID_TIMEOUT, max_nodes=HYBRID_MAX_NODES)
         else:
-            path, stats = planner.plan(start, goal, timeout=30.0, max_nodes=40000)
+            path, stats = planner.plan(start, goal, timeout=RL_TIMEOUT, max_nodes=RL_MAX_NODES)
         stats["time_wall"] = time.time() - t0
         success = len(path) > 0
         expansions = stats.get("expansions", stats.get("expansions_total", stats.get("nodes", "-")))

@@ -6,7 +6,7 @@ from typing import List, Tuple
 import numpy as np
 
 from .common import euclidean, heading_diff
-from .geometry import motion_collides
+from .geometry import GridFootprintChecker
 from .robot import AckermannParams, AckermannState, simulate_forward
 
 
@@ -30,6 +30,7 @@ class RRTStarPlanner:
         goal_xy_tol: float = 0.2,
         goal_theta_tol: float = math.radians(15.0),
         connect_threshold: float = 1.0,
+        theta_bins: int = 72,
     ):
         self.map = grid_map
         self.footprint = footprint
@@ -42,6 +43,7 @@ class RRTStarPlanner:
         self.goal_theta_tol = goal_theta_tol
         self.connect_threshold = connect_threshold
         self.rng = np.random.default_rng(3)
+        self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
     def plan(
         self,
@@ -60,12 +62,8 @@ class RRTStarPlanner:
             sample_state = self._sample_state(goal)
             nearest_idx = self._nearest(tree, sample_state)
             new_state = self._steer(tree[nearest_idx].state, sample_state)
-            if motion_collides(
-                self.map,
-                self.footprint,
-                tree[nearest_idx].state.as_tuple(),
-                new_state.as_tuple(),
-                step=self.map.resolution * 0.5,
+            if self.collision_checker.motion_collides(
+                tree[nearest_idx].state.as_tuple(), new_state.as_tuple(), step=self.map.resolution * 0.5
             ):
                 continue
             new_cost = tree[nearest_idx].cost + self._segment_cost(tree[nearest_idx].state, new_state)
@@ -74,8 +72,8 @@ class RRTStarPlanner:
             neighbors = self._neighbors(tree, new_state)
             for n_idx in neighbors:
                 cand_cost = tree[n_idx].cost + self._segment_cost(tree[n_idx].state, new_state)
-                if cand_cost < new_cost and not motion_collides(
-                    self.map, self.footprint, tree[n_idx].state.as_tuple(), new_state.as_tuple(), step=0.05
+                if cand_cost < new_cost and not self.collision_checker.motion_collides(
+                    tree[n_idx].state.as_tuple(), new_state.as_tuple(), step=0.05
                 ):
                     new_cost = cand_cost
                     parent_idx = n_idx
@@ -86,8 +84,8 @@ class RRTStarPlanner:
             # rewire neighbors
             for n_idx in neighbors:
                 cand_cost = new_cost + self._segment_cost(new_state, tree[n_idx].state)
-                if cand_cost + 1e-6 < tree[n_idx].cost and not motion_collides(
-                    self.map, self.footprint, new_state.as_tuple(), tree[n_idx].state.as_tuple(), step=0.05
+                if cand_cost + 1e-6 < tree[n_idx].cost and not self.collision_checker.motion_collides(
+                    new_state.as_tuple(), tree[n_idx].state.as_tuple(), step=0.05
                 ):
                     tree[n_idx].parent = new_idx
                     tree[n_idx].cost = cand_cost
@@ -178,12 +176,8 @@ class RRTStarPlanner:
         dist = math.hypot(dx, dy)
         if dist > self.connect_threshold:
             return False
-        if motion_collides(
-            self.map,
-            self.footprint,
-            state.as_tuple(),
-            goal.as_tuple(),
-            step=self.map.resolution * 0.5,
+        if self.collision_checker.motion_collides(
+            state.as_tuple(), goal.as_tuple(), step=self.map.resolution * 0.5
         ):
             return False
         return True

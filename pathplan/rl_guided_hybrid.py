@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .common import heading_diff
-from .geometry import path_collides
+from .geometry import GridFootprintChecker
 from .heuristics import admissible_heuristic
 from .primitives import MotionPrimitive, default_primitives, primitive_cost
 from .rl_models import RLGuidance
@@ -63,6 +63,7 @@ class RLGuidedHybridPlanner:
         self.anchor_inflation = anchor_inflation
         self.rl_weight = rl_weight
         self.rl = RLGuidance(params)
+        self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
     def _discretize(self, state: AckermannState) -> Tuple[int, int, int]:
         gx, gy = self.map.world_to_grid(state.x, state.y)
@@ -156,7 +157,7 @@ class RLGuidedHybridPlanner:
                     footprint=None,
                 )
                 nxt = arc_states[-1]
-                if path_collides(self.map, self.footprint, [s.as_tuple() for s in arc_states], sample_step=self.collision_step):
+                if self.collision_checker.collides_path(arc_states):
                     continue
                 g_new = current.g + primitive_cost(prim)
                 if current.action and prim.direction != current.action.direction:

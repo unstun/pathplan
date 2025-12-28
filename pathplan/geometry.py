@@ -70,6 +70,85 @@ class OrientedBoxFootprint:
         return False
 
 
+def _footprint_offsets_for_heading(
+    footprint: OrientedBoxFootprint, resolution: float, theta: float, padding: float = 0.0
+) -> List[Tuple[int, int]]:
+    """
+    Compute grid offsets whose cell centers fall inside the footprint at a given heading.
+    Offsets are returned as integer (dx, dy) in grid cells relative to the robot center cell.
+    """
+    hl = footprint.half_length + padding
+    hw = footprint.half_width + padding
+    radius = math.hypot(hl, hw)
+    cells = int(math.ceil(radius / resolution)) + 1  # include boundary cells
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    offsets: List[Tuple[int, int]] = []
+    for gx in range(-cells, cells + 1):
+        for gy in range(-cells, cells + 1):
+            wx = gx * resolution
+            wy = gy * resolution
+            # rotate world offset into robot frame
+            rx = cos_t * wx + sin_t * wy
+            ry = -sin_t * wx + cos_t * wy
+            if abs(rx) <= hl and abs(ry) <= hw:
+                offsets.append((gx, gy))
+    return offsets
+
+
+class GridFootprintChecker:
+    """
+    Grid-based collision checker that precomputes footprint cell offsets per heading bin.
+    """
+
+    def __init__(self, grid_map, footprint: OrientedBoxFootprint, theta_bins: int, padding: float = 0.0):
+        self.map = grid_map
+        self.theta_bins = theta_bins
+        self.offsets: List[List[Tuple[int, int]]] = []
+        for i in range(theta_bins):
+            theta = (2.0 * math.pi * i) / theta_bins
+            self.offsets.append(_footprint_offsets_for_heading(footprint, grid_map.resolution, theta, padding))
+
+    def _theta_index(self, theta: float) -> int:
+        return int(round(((theta % (2 * math.pi)) / (2 * math.pi)) * self.theta_bins)) % self.theta_bins
+
+    def _collides_grid(self, gx: int, gy: int, theta_idx: int) -> bool:
+        h, w = self.map.data.shape
+        for dx, dy in self.offsets[theta_idx]:
+            cx = gx + dx
+            cy = gy + dy
+            if cx < 0 or cx >= w or cy < 0 or cy >= h:
+                return True
+            if self.map.data[cy, cx]:
+                return True
+        return False
+
+    def collides_pose(self, x: float, y: float, theta: float) -> bool:
+        gx, gy = self.map.world_to_grid(x, y)
+        theta_idx = self._theta_index(theta)
+        return self._collides_grid(gx, gy, theta_idx)
+
+    def collides_path(self, poses: Iterable[Tuple[float, float, float]]) -> bool:
+        for pose in poses:
+            if hasattr(pose, "x"):
+                x, y, theta = pose.x, pose.y, pose.theta
+            else:
+                x, y, theta = pose
+            if self.collides_pose(x, y, theta):
+                return True
+        return False
+
+    def motion_collides(
+        self, start: Tuple[float, float, float], end: Tuple[float, float, float], step: float
+    ) -> bool:
+        if self.collides_pose(start[0], start[1], start[2]):
+            return True
+        for pose in interpolate_poses(start, end, step):
+            if self.collides_pose(pose[0], pose[1], pose[2]):
+                return True
+        return False
+
+
 def interpolate_poses(
     start: Tuple[float, float, float],
     end: Tuple[float, float, float],
