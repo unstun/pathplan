@@ -8,7 +8,7 @@ from .common import heading_diff
 from .geometry import GridFootprintChecker
 from .heuristics import admissible_heuristic
 from .primitives import MotionPrimitive, default_primitives, primitive_cost
-from .rl_models import RLGuidance
+from .dqn_models import DQNGuidance
 from .robot import AckermannParams, AckermannState, sample_constant_steer_motion
 
 
@@ -17,22 +17,26 @@ class Node:
     state: AckermannState
     g: float
     h_anchor: float
-    h_rl: float
+    h_dqn: float
     parent: Optional["Node"]
     action: Optional[MotionPrimitive]
+    dqn_features: Optional[Tuple[float, float, float, float]] = None
+    dqn_heading_err: float = 0.0
+    dqn_front_occ: float = 0.0
 
     @property
     def f_anchor(self) -> float:
         return self.g + self.h_anchor
 
-    def f_rl(self, weight: float) -> float:
-        return self.g + weight * self.h_rl
+    def f_dqn(self, weight: float) -> float:
+        return self.g + weight * self.h_dqn
 
 
-class RLGuidedHybridPlanner:
+class DQNHybridAStarPlanner:
     """
-    Multi-heuristic Hybrid A* with RL-guided queue + action ordering.
-    Anchor queue preserves completeness; RL queue biases speed.
+    Multi-heuristic Hybrid A* with DQN-guided queue + action ordering.
+    Anchor queue preserves completeness; DQN queue biases speed.
+    Drop in a trained DQN inside DQNGuidance to replace the lightweight heuristic.
     """
 
     def __init__(
@@ -41,32 +45,33 @@ class RLGuidedHybridPlanner:
         footprint,
         params: AckermannParams,
         primitives: Optional[List[MotionPrimitive]] = None,
-        xy_resolution: float = 0.1,
+        xy_resolution: Optional[float] = None,
         theta_bins: int = 72,
         collision_step: float = 0.1,
         goal_xy_tol: float = 0.3,
         goal_theta_tol: float = math.radians(15.0),
-        rl_top_k: Optional[int] = None,
+        dqn_top_k: Optional[int] = None,
         anchor_inflation: float = 1.0,
-        rl_weight: float = 1.0,
+        dqn_weight: float = 1.0,
     ):
         self.map = grid_map
         self.footprint = footprint
         self.params = params
         self.primitives = primitives if primitives is not None else default_primitives(params)
-        self.xy_resolution = xy_resolution
+        self.xy_resolution = xy_resolution if xy_resolution is not None else grid_map.resolution
         self.theta_bins = theta_bins
         self.collision_step = collision_step
         self.goal_xy_tol = goal_xy_tol
         self.goal_theta_tol = goal_theta_tol
-        self.rl_top_k = rl_top_k
+        self.dqn_top_k = dqn_top_k
         self.anchor_inflation = anchor_inflation
-        self.rl_weight = rl_weight
-        self.rl = RLGuidance(params)
+        self.dqn_weight = dqn_weight
+        self.dqn = DQNGuidance(params)
         self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
     def _discretize(self, state: AckermannState) -> Tuple[int, int, int]:
-        gx, gy = self.map.world_to_grid(state.x, state.y)
+        gx = int(round((state.x - self.map.origin[0]) / self.xy_resolution))
+        gy = int(round((state.y - self.map.origin[1]) / self.xy_resolution))
         theta_id = int(round(((state.theta % (2 * math.pi)) / (2 * math.pi)) * self.theta_bins)) % self.theta_bins
         return gx, gy, theta_id
 
@@ -77,6 +82,9 @@ class RLGuidedHybridPlanner:
         dtheta = abs(heading_diff(goal.theta, state.theta))
         return dist <= self.goal_xy_tol and dtheta <= self.goal_theta_tol
 
+    def _anchor_priority(self, node: Node) -> float:
+        return node.g + self.anchor_inflation * node.h_anchor
+
     def plan(
         self,
         start: AckermannState,
@@ -86,38 +94,54 @@ class RLGuidedHybridPlanner:
     ) -> Tuple[List[AckermannState], Dict[str, float]]:
         start_time = time.time()
         anchor_heap: List[Tuple[float, int, Node]] = []
-        rl_heap: List[Tuple[float, int, Node]] = []
+        dqn_heap: List[Tuple[float, int, Node]] = []
 
         h_a = admissible_heuristic(start.as_tuple(), goal.as_tuple(), self.params)
-        h_rl = self.rl.value(start.as_tuple(), goal.as_tuple(), self.map)
-        start_node = Node(start, g=0.0, h_anchor=h_a, h_rl=h_rl, parent=None, action=None)
-        heapq.heappush(anchor_heap, (start_node.f_anchor, 0, start_node))
-        heapq.heappush(rl_heap, (start_node.f_rl(self.rl_weight), 0, start_node))
+        dqn_feats, dqn_front_occ, dqn_heading_err = self.dqn.evaluate(start.as_tuple(), goal.as_tuple(), self.map)
+        h_dqn = self.dqn.value_from_features(dqn_feats)
+        start_node = Node(
+            start,
+            g=0.0,
+            h_anchor=h_a,
+            h_dqn=h_dqn,
+            parent=None,
+            action=None,
+            dqn_features=dqn_feats,
+            dqn_heading_err=dqn_heading_err,
+            dqn_front_occ=dqn_front_occ,
+        )
+        heapq.heappush(anchor_heap, (self._anchor_priority(start_node), 0, start_node))
+        heapq.heappush(dqn_heap, (start_node.f_dqn(self.dqn_weight), 0, start_node))
 
         visited: Dict[Tuple[int, int, int], float] = {}
         expansions_anchor = 0
-        expansions_rl = 0
+        expansions_dqn = 0
         iterations = 0
         counter = 1
 
-        while (anchor_heap or rl_heap) and (time.time() - start_time) < timeout and (
-            expansions_anchor + expansions_rl
+        while (anchor_heap or dqn_heap) and (time.time() - start_time) < timeout and (
+            expansions_anchor + expansions_dqn
         ) < max_nodes:
-            # Alternate between anchor and RL to preserve coverage.
+            # Alternate between anchor and DQN to preserve coverage.
             iterations += 1
             use_anchor = True
-            if iterations % 2 == 1 and rl_heap:
+            if iterations % 2 == 1 and dqn_heap:
                 use_anchor = False
             if not anchor_heap:
                 use_anchor = False
-            if not rl_heap:
+            if not dqn_heap:
                 use_anchor = True
-            heap = anchor_heap if use_anchor else rl_heap
+            heap = anchor_heap if use_anchor else dqn_heap
             _, _, current = heapq.heappop(heap)
             key = self._discretize(current.state)
             if key in visited and visited[key] <= current.g:
                 continue
             visited[key] = current.g
+            if current.dqn_features is None:
+                feats, front_occ, heading_err = self.dqn.evaluate(current.state.as_tuple(), goal.as_tuple(), self.map)
+                current.dqn_features = feats
+                current.dqn_front_occ = front_occ
+                current.dqn_heading_err = heading_err
 
             if self._goal_reached(current.state, goal):
                 path, actions = self._reconstruct_with_actions(current)
@@ -128,7 +152,7 @@ class RLGuidedHybridPlanner:
                 return path, self._stats(
                     path,
                     expansions_anchor,
-                    expansions_rl,
+                    expansions_dqn,
                     time.time() - start_time,
                     trace_poses,
                     trace_boxes,
@@ -139,10 +163,15 @@ class RLGuidedHybridPlanner:
                 expansions_anchor += 1
                 actions = list(self.primitives)
             else:
-                expansions_rl += 1
-                scores = self.rl.policy(current.state.as_tuple(), goal.as_tuple(), self.map, self.primitives)
+                expansions_dqn += 1
+                scores = self.dqn.policy_from_eval(
+                    current.dqn_features,
+                    current.dqn_heading_err,
+                    current.dqn_front_occ,
+                    self.primitives,
+                )
                 idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-                k = self.rl_top_k if self.rl_top_k is not None else len(idx)
+                k = self.dqn_top_k if self.dqn_top_k is not None else len(idx)
                 chosen = idx[:k]
                 actions = [self.primitives[i] for i in chosen]
 
@@ -162,20 +191,31 @@ class RLGuidedHybridPlanner:
                 g_new = current.g + primitive_cost(prim)
                 if current.action and prim.direction != current.action.direction:
                     g_new += 0.2
-                h_a_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
-                h_rl_new = self.rl.value(nxt.as_tuple(), goal.as_tuple(), self.map)
                 new_key = self._discretize(nxt)
                 if new_key in visited and visited[new_key] <= g_new:
                     continue
-                node = Node(nxt, g=g_new, h_anchor=h_a_new, h_rl=h_rl_new, parent=current, action=prim)
-                heapq.heappush(anchor_heap, (node.f_anchor, counter, node))
-                heapq.heappush(rl_heap, (node.f_rl(self.rl_weight), counter, node))
+                h_a_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
+                dqn_feats, dqn_front_occ, dqn_heading_err = self.dqn.evaluate(nxt.as_tuple(), goal.as_tuple(), self.map)
+                h_dqn_new = self.dqn.value_from_features(dqn_feats)
+                node = Node(
+                    nxt,
+                    g=g_new,
+                    h_anchor=h_a_new,
+                    h_dqn=h_dqn_new,
+                    parent=current,
+                    action=prim,
+                    dqn_features=dqn_feats,
+                    dqn_heading_err=dqn_heading_err,
+                    dqn_front_occ=dqn_front_occ,
+                )
+                heapq.heappush(anchor_heap, (self._anchor_priority(node), counter, node))
+                heapq.heappush(dqn_heap, (node.f_dqn(self.dqn_weight), counter, node))
                 counter += 1
 
         return [], self._stats(
             [],
             expansions_anchor,
-            expansions_rl,
+            expansions_dqn,
             time.time() - start_time,
             [],
             [],
@@ -225,7 +265,7 @@ class RLGuidedHybridPlanner:
         self,
         path: List[AckermannState],
         expansions_anchor: int,
-        expansions_rl: int,
+        expansions_dqn: int,
         elapsed: float,
         trace_poses: List[Tuple[float, float, float]],
         trace_boxes: List[List[Tuple[float, float]]],
@@ -239,8 +279,8 @@ class RLGuidedHybridPlanner:
         stats = {
             "path_length": length,
             "expansions_anchor": expansions_anchor,
-            "expansions_rl": expansions_rl,
-            "expansions_total": expansions_anchor + expansions_rl,
+            "expansions_dqn": expansions_dqn,
+            "expansions_total": expansions_anchor + expansions_dqn,
             "time": elapsed,
             "timed_out": timed_out,
         }

@@ -2,23 +2,25 @@
 Path planning scaffold for Ackermann robots with strict turning radius and oriented footprint.
 Exports planners:
 - HybridAStarPlanner
-- RLGuidedHybridPlanner
+- DQNHybridAStarPlanner
 - RRTStarPlanner
 """
 
 from .hybrid_a_star import HybridAStarPlanner
-from .rl_guided_hybrid import RLGuidedHybridPlanner
+from .dqn_hybrid_a_star import DQNHybridAStarPlanner
 from .rrt_star import RRTStarPlanner
 from .robot import AckermannParams, AckermannState
 from .geometry import OrientedBoxFootprint
 from .map_utils import GridMap
+from .dqn_models import TorchDQNGuidance
 
 __all__ = [
     "HybridAStarPlanner",
-    "RLGuidedHybridPlanner",
+    "DQNHybridAStarPlanner",
     "RRTStarPlanner",
     "AckermannParams",
     "AckermannState",
     "OrientedBoxFootprint",
     "GridMap",
+    "TorchDQNGuidance",
 ]

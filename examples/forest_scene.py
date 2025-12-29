@@ -1,14 +1,22 @@
 """
 Dense forest scenario with many tree obstacles (flat terrain, no slopes).
-Run:
-    python -m examples.forest_scene
-The script will print planner stats and save a plot to examples/outputs/.
+Four presets are available: large map, small map, large gap, small gap.
+Run, for example:
+    python -m examples.forest_scene --variant large_map
+    python -m examples.forest_scene --variant small_gap
+Use --variant all to generate every preset.
+The script prints planner stats and saves a plot to examples/outputs/.
 """
 
+import argparse
+import os
 import math
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# Allow duplicated Intel OpenMP runtimes (NumPy + other libs) to coexist for this script.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 import numpy as np
 
@@ -18,7 +26,7 @@ from pathplan import (
     GridMap,
     HybridAStarPlanner,
     OrientedBoxFootprint,
-    RLGuidedHybridPlanner,
+    DQNHybridAStarPlanner,
     RRTStarPlanner,
 )
 from pathplan.primitives import default_primitives
@@ -28,17 +36,15 @@ try:
 except ImportError:
     plt = None
 
-# Shared defaults used by both the planner and the interactive editor.
-DEFAULT_START = AckermannState(5.0, 5.0, 0.0)
-DEFAULT_GOAL = AckermannState(75.0, 43.0, 0.0)
+# Base defaults used by all presets and the interactive editor.
 FOREST_MAP_KWARGS = dict(
     resolution=0.10,
-    size=(80.0, 48.0),
+    size=(40.0, 28.0),
     num_trees=400,  # dense but still navigable
     tree_radius=0.30,
     clearance=1.8,
     seed=13,
-    keep_clear=[(DEFAULT_START.x, DEFAULT_START.y), (DEFAULT_GOAL.x, DEFAULT_GOAL.y)],
+    keep_clear=None,  # filled dynamically based on the map size
     carve_points=None,
     wall_y=None,
     wall_gap=(7.0, 4.0),
@@ -46,13 +52,77 @@ FOREST_MAP_KWARGS = dict(
     protected_path=None,
 )
 
-# Planner budgets tuned for the dense forest benchmark.
-HYBRID_TIMEOUT = 300.0  # give classic Hybrid A* more wall-clock time before declaring failure
-HYBRID_MAX_NODES = 400_000
-RL_TIMEOUT = 120.0
-RL_MAX_NODES = 200_000
-RRT_TIMEOUT = 60.0
-RRT_MAX_ITER = 60_000
+FOREST_VARIANTS = {
+    "large_map": {
+        "title": "Forest (large map)",
+        "map_kwargs": {
+            "size": (64.0, 40.0),
+            "num_trees": 750,
+            "clearance": 1.8,
+            "resolution": 0.10,
+        },
+    },
+    "small_map": {
+        "title": "Forest (small map)",
+        "map_kwargs": {
+            "size": (24.0, 16.0),
+            "num_trees": 180,
+            "clearance": 1.5,
+            "resolution": 0.08,
+        },
+    },
+    "large_gap": {
+        "title": "Forest (large gap)",
+        "map_kwargs": {
+            "num_trees": 380,
+            "clearance": 1.6,
+        },
+        "gap_width": 8.0,
+        "wall_y_factor": 0.55,
+    },
+    "small_gap": {
+        "title": "Forest (small gap)",
+        "map_kwargs": {
+            "num_trees": 380,
+            "clearance": 1.6,
+        },
+        "gap_width": 3.0,
+        "wall_y_factor": 0.55,
+    },
+}
+
+
+def compute_start_goal(map_kwargs):
+    """
+    Derive start/goal inside the map bounds from the map settings.
+    Positions scale with map size and respect clearance/tree radius.
+    """
+    size_x, size_y = map_kwargs.get("size", (80.0, 48.0))
+    tree_r = map_kwargs.get("tree_radius", 0.30)
+    clearance = map_kwargs.get("clearance", 1.8)
+    margin = max(tree_r * 2.0, tree_r + clearance + 0.6)
+    start = AckermannState(
+        max(margin, size_x * 0.08),
+        max(margin, size_y * 0.20),
+        0.0,
+    )
+    goal = AckermannState(
+        min(size_x - margin, size_x * 0.92),
+        min(size_y - margin, size_y * 0.80),
+        0.0,
+    )
+    return start, goal
+
+
+DEFAULT_START, DEFAULT_GOAL = compute_start_goal(FOREST_MAP_KWARGS)
+
+# Planner budgets tuned for sub-second runs.
+HYBRID_TIMEOUT = 1.0
+HYBRID_MAX_NODES = 8_000
+DQN_TIMEOUT = 1.0
+DQN_MAX_NODES = 8_000
+RRT_TIMEOUT = 1.0
+RRT_MAX_ITER = 20_000
 
 
 def make_forest_map(
@@ -186,6 +256,7 @@ def make_forest_map(
 
 def plot_with_boxes(
     name: str,
+    variant_slug: str,
     grid_map: GridMap,
     start: AckermannState,
     goal: AckermannState,
@@ -239,34 +310,85 @@ def plot_with_boxes(
     ax.set_title(name)
     ax.legend(loc="upper right")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "dense_forest_no_slope_many_trees.png"
+    safe_slug = variant_slug or "default"
+    out_path = out_dir / f"dense_forest_{safe_slug}.png"
     fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
 
-def plan_forest_scene():
-    output_dir = Path(__file__).resolve().parent / "outputs"
-    start = DEFAULT_START
-    goal = DEFAULT_GOAL
+def normalize_variant(name: str) -> str:
+    slug = name.strip().lower().replace(" ", "_").replace("-", "_")
+    if slug not in FOREST_VARIANTS:
+        options = ", ".join(sorted(FOREST_VARIANTS))
+        raise ValueError(f"Unknown variant '{name}'. Choose from: {options}.")
+    return slug
+
+
+def build_variant(variant: str):
+    variant_slug = normalize_variant(variant)
+    cfg = FOREST_VARIANTS[variant_slug]
     map_kwargs = dict(FOREST_MAP_KWARGS)
+    map_kwargs.update(cfg.get("map_kwargs", {}))
+
+    if variant_slug in ("large_gap", "small_gap"):
+        size_x, size_y = map_kwargs["size"]
+        map_kwargs["wall_y"] = cfg.get("wall_y_factor", 0.5) * size_y
+        gap_width = cfg.get("gap_width", map_kwargs.get("wall_gap", (size_x * 0.5, 4.0))[1])
+        map_kwargs["wall_gap"] = (size_x * 0.5, gap_width)
+        if map_kwargs.get("wall_radius") is None:
+            map_kwargs["wall_radius"] = map_kwargs.get("tree_radius", 0.30) * 1.05
+
+    start, goal = compute_start_goal(map_kwargs)
     map_kwargs["keep_clear"] = [(start.x, start.y), (goal.x, goal.y)]
+    title = cfg.get("title", f"Forest ({variant_slug})")
+    return variant_slug, title, map_kwargs, start, goal
+
+
+def plan_forest_scene(variant: str = "large_map"):
+    output_dir = Path(__file__).resolve().parent / "outputs"
+    variant_slug, title, map_kwargs, start, goal = build_variant(variant)
     grid_map = make_forest_map(**map_kwargs)
+
+    print(
+        f"Variant '{variant_slug}': size={map_kwargs['size']} m, "
+        f"trees={map_kwargs['num_trees']}, resolution={map_kwargs['resolution']:.2f} m"
+    )
+    if map_kwargs.get("wall_y") is not None:
+        gap_center, gap_width = map_kwargs["wall_gap"]
+        print(f"  Wall at y={map_kwargs['wall_y']:.2f} with gap center={gap_center:.2f}, width={gap_width:.2f}")
 
     params = AckermannParams()
     footprint = OrientedBoxFootprint(length=0.924, width=0.740)
-    short_primitives = default_primitives(params, step_length=0.6)
+    short_primitives = default_primitives(params, step_length=1.0)
     base_kwargs = dict(
-        xy_resolution=0.35,
-        collision_step=0.10,
+        xy_resolution=0.60,
+        collision_step=0.20,
         goal_xy_tol=1.5,
         goal_theta_tol=math.pi,
+        theta_bins=48,
     )
-    rl_kwargs = dict(base_kwargs, rl_top_k=5)
+    hybrid_kwargs = dict(base_kwargs, heuristic_weight=2.2)
+    dqn_kwargs = dict(base_kwargs, dqn_top_k=3, anchor_inflation=2.0, dqn_weight=1.3)
+    rrt_kwargs = dict(
+        goal_sample_rate=0.55,  # lower bias to escape blocked goal rays faster
+        neighbor_radius=3.5,
+        step_time=1.40,  # longer rollout per sample = fewer iterations to reach the goal
+        velocity=1.40,
+        connect_threshold=5.0,
+        goal_xy_tol=0.8,
+        goal_theta_tol=math.pi,
+        goal_check_freq=1,
+        seed_steps=30,
+        collision_step=0.20,
+        lazy_collision=False,  # full motion collision checking (still sub-second with the longer step_time)
+        rewire=False,
+        theta_bins=48,
+    )
     planners = [
-        ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **base_kwargs)),
-        ("RL-guided Hybrid A*", RLGuidedHybridPlanner(grid_map, footprint, params, primitives=short_primitives, **rl_kwargs)),
-        ("RRT*", RRTStarPlanner(grid_map, footprint, params)),
+        ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **hybrid_kwargs)),
+        ("DQN Hybrid A*", DQNHybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **dqn_kwargs)),
+        ("RRT*", RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
     ]
 
     planner_results = []
@@ -277,7 +399,7 @@ def plan_forest_scene():
         elif isinstance(planner, HybridAStarPlanner):
             path, stats = planner.plan(start, goal, timeout=HYBRID_TIMEOUT, max_nodes=HYBRID_MAX_NODES)
         else:
-            path, stats = planner.plan(start, goal, timeout=RL_TIMEOUT, max_nodes=RL_MAX_NODES)
+            path, stats = planner.plan(start, goal, timeout=DQN_TIMEOUT, max_nodes=DQN_MAX_NODES)
         stats["time_wall"] = time.time() - t0
         success = len(path) > 0
         expansions = stats.get("expansions", stats.get("expansions_total", stats.get("nodes", "-")))
@@ -294,7 +416,8 @@ def plan_forest_scene():
             planner_results.append((label, path, stats))
 
     saved_plot = plot_with_boxes(
-        "Dense forest (no slope, many trees)",
+        title,
+        variant_slug,
         grid_map,
         start,
         goal,
@@ -306,5 +429,21 @@ def plan_forest_scene():
         print(f"Saved plot: {saved_plot}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Forest scene planner presets.")
+    parser.add_argument(
+        "--variant",
+        default="large_map",
+        help="Choose from: large_map, small_map, large_gap, small_gap, or 'all' to run every preset.",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    plan_forest_scene()
+    args = parse_args()
+    if args.variant.strip().lower() in ("all", "any"):
+        for variant_name in FOREST_VARIANTS:
+            print("\n" + "=" * 60)
+            plan_forest_scene(variant_name)
+    else:
+        plan_forest_scene(args.variant)

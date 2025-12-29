@@ -32,25 +32,28 @@ class HybridAStarPlanner:
         footprint,
         params: AckermannParams,
         primitives: Optional[List[MotionPrimitive]] = None,
-        xy_resolution: float = 0.1,
+        xy_resolution: Optional[float] = None,
         theta_bins: int = 72,
         collision_step: float = 0.1,
         goal_xy_tol: float = 0.3,
         goal_theta_tol: float = math.radians(15.0),
+        heuristic_weight: float = 1.0,
     ):
         self.map = grid_map
         self.footprint = footprint
         self.params = params
         self.primitives = primitives if primitives is not None else default_primitives(params)
-        self.xy_resolution = xy_resolution
+        self.xy_resolution = xy_resolution if xy_resolution is not None else grid_map.resolution
         self.theta_bins = theta_bins
         self.collision_step = collision_step
         self.goal_xy_tol = goal_xy_tol
         self.goal_theta_tol = goal_theta_tol
+        self.heuristic_weight = max(heuristic_weight, 1e-6)
         self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
     def _discretize(self, state: AckermannState) -> Tuple[int, int, int]:
-        gx, gy = self.map.world_to_grid(state.x, state.y)
+        gx = int(round((state.x - self.map.origin[0]) / self.xy_resolution))
+        gy = int(round((state.y - self.map.origin[1]) / self.xy_resolution))
         theta_id = int(round(((state.theta % (2 * math.pi)) / (2 * math.pi)) * self.theta_bins)) % self.theta_bins
         return gx, gy, theta_id
 
@@ -60,6 +63,9 @@ class HybridAStarPlanner:
         dist = math.hypot(dx, dy)
         dtheta = abs(heading_diff(goal.theta, state.theta))
         return dist <= self.goal_xy_tol and dtheta <= self.goal_theta_tol
+
+    def _priority(self, node: Node) -> float:
+        return node.g + self.heuristic_weight * node.h
 
     def plan(
         self,
@@ -73,7 +79,7 @@ class HybridAStarPlanner:
         open_heap: List[Tuple[float, int, Node]] = []
         h0 = admissible_heuristic(start.as_tuple(), goal.as_tuple(), self.params)
         start_node = Node(start, g=0.0, h=h0, parent=None, action=None)
-        heapq.heappush(open_heap, (start_node.f, 0, start_node))
+        heapq.heappush(open_heap, (self._priority(start_node), 0, start_node))
         visited: Dict[Tuple[int, int, int], float] = {}
         expansions = 0
         insert_counter = 1
@@ -110,9 +116,12 @@ class HybridAStarPlanner:
                 g_new = current.g + primitive_cost(prim)
                 if current.action and prim.direction != current.action.direction:
                     g_new += 0.2  # cusp penalty
+                new_key = self._discretize(nxt)
+                if new_key in visited and visited[new_key] <= g_new:
+                    continue
                 h_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
                 node = Node(nxt, g=g_new, h=h_new, parent=current, action=prim)
-                heapq.heappush(open_heap, (node.f, insert_counter, node))
+                heapq.heappush(open_heap, (self._priority(node), insert_counter, node))
                 insert_counter += 1
 
         return [], self._stats([], expansions, time.time() - start_time, [], [], timed_out=True)

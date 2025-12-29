@@ -60,9 +60,15 @@ class GridMap:
         Uses nearest-neighbor sampling to avoid extra deps.
         """
         half = size_m / 2.0
-        # grid in robot frame
-        lin = np.linspace(-half, half, cells)
-        xs, ys = np.meshgrid(lin, lin, indexing="xy")
+        if not hasattr(self, "_patch_cache"):
+            self._patch_cache = {}
+        cache_key = (size_m, cells)
+        if cache_key in self._patch_cache:
+            xs, ys = self._patch_cache[cache_key]
+        else:
+            lin = np.linspace(-half, half, cells)
+            xs, ys = np.meshgrid(lin, lin, indexing="xy")
+            self._patch_cache[cache_key] = (xs, ys)
         cos_t = math.cos(theta)
         sin_t = math.sin(theta)
         world_x = x + cos_t * xs - sin_t * ys
@@ -99,9 +105,12 @@ class GridMap:
         self, rng: np.random.Generator, yaw_range: Tuple[float, float] = (-math.pi, math.pi)
     ) -> Tuple[float, float, float]:
         """Sample a collision-free pose uniformly from free cells and random yaw."""
-        free_indices = np.argwhere(self.data == 0)
-        if len(free_indices) == 0:
-            raise ValueError("Map has no free cells")
+        if not hasattr(self, "_free_indices_cache"):
+            free_indices = np.argwhere(self.data == 0)
+            if len(free_indices) == 0:
+                raise ValueError("Map has no free cells")
+            self._free_indices_cache = free_indices
+        free_indices = self._free_indices_cache
         idx = rng.integers(0, len(free_indices))
         gy, gx = free_indices[idx]
         x, y = self.grid_to_world(int(gx), int(gy))

@@ -21,7 +21,13 @@ from typing import Tuple
 import numpy as np
 
 from pathplan import AckermannState, GridMap
-from .forest_scene import DEFAULT_GOAL, DEFAULT_START, FOREST_MAP_KWARGS, make_forest_map
+from .forest_scene import (
+    DEFAULT_GOAL,
+    DEFAULT_START,
+    FOREST_MAP_KWARGS,
+    compute_start_goal,
+    make_forest_map,
+)
 
 try:
     import matplotlib.pyplot as plt
@@ -29,10 +35,11 @@ except ImportError:
     plt = None
 
 
-def build_default_map() -> GridMap:
+def build_default_map() -> Tuple[GridMap, AckermannState, AckermannState]:
     map_kwargs = dict(FOREST_MAP_KWARGS)
-    map_kwargs["keep_clear"] = [(DEFAULT_START.x, DEFAULT_START.y), (DEFAULT_GOAL.x, DEFAULT_GOAL.y)]
-    return make_forest_map(**map_kwargs)
+    start, goal = compute_start_goal(map_kwargs)
+    map_kwargs["keep_clear"] = [(start.x, start.y), (goal.x, goal.y)]
+    return make_forest_map(**map_kwargs), start, goal
 
 
 def load_grid_map(input_path: Path, resolution: float) -> GridMap:
@@ -197,10 +204,16 @@ def main():
     args = parse_args()
     if args.input is not None:
         grid_map = load_grid_map(args.input, args.resolution)
-        start, goal = DEFAULT_START, DEFAULT_GOAL
+        w_m = grid_map.data.shape[1] * grid_map.resolution
+        h_m = grid_map.data.shape[0] * grid_map.resolution
+        map_kwargs = {
+            "size": (w_m, h_m),
+            "tree_radius": FOREST_MAP_KWARGS.get("tree_radius", 0.30),
+            "clearance": FOREST_MAP_KWARGS.get("clearance", 1.8),
+        }
+        start, goal = compute_start_goal(map_kwargs)
     else:
-        grid_map = build_default_map()
-        start, goal = DEFAULT_START, DEFAULT_GOAL
+        grid_map, start, goal = build_default_map()
 
     editor = ForestMapEditor(grid_map, start, goal, Path(args.save), brush=args.brush)
     editor.show()

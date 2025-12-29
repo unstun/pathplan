@@ -12,7 +12,7 @@ from pathplan import (
     HybridAStarPlanner,
     OrientedBoxFootprint,
     RRTStarPlanner,
-    RLGuidedHybridPlanner,
+    DQNHybridAStarPlanner,
 )
 
 try:
@@ -115,7 +115,7 @@ def run_scenario(
     print(f"\n=== Scenario: {name} ===")
     planners = [
         ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params)),
-        ("RL-guided Hybrid A*", RLGuidedHybridPlanner(grid_map, footprint, params)),
+        ("DQN Hybrid A*", DQNHybridAStarPlanner(grid_map, footprint, params)),
         ("RRT*", RRTStarPlanner(grid_map, footprint, params)),
     ]
 
