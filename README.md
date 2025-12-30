@@ -1,105 +1,65 @@
 # Path Planning Scaffold
 
-Python scaffold for benchmarking Ackermann path planners (Hybrid A*, DQN-guided Hybrid A*, Artificial Potential Field, and kinodynamic RRT*) under a consistent robot model (strict minimum turning radius and oriented rectangular footprint). Built to be hackable, lightweight, and fair for research experiments.
+Python scaffold for Ackermann planners (Hybrid A*, DQN-guided Hybrid A*, Artificial Potential Field, kinodynamic RRT*) with a shared robot model and grid-based collision checker. Everything is NumPy-first, ROS-free, and kept small so you can swap pieces without digging through a framework.
 
-## Why use this scaffold
+## What’s inside (code map)
 
-- One robot model for all planners: identical kinematics (Ackermann bicycle), turning limits, and oriented-box collision model for apples-to-apples comparisons.
-- Minimal dependencies: NumPy-only core, no ROS; DQN guidance runs with or without PyTorch (deterministic NumPy fallback).
-- Ready-to-run demo scenarios plus clear stats (path length, expansions, timing, node counts) for quick baselining.
-- Modular library: small, readable modules for motion primitives, heuristics, collision checking, DQN guidance, and planners.
-- Extensible hooks: swap heuristics, change motion primitives, plug in real DQN/RL models, or tighten safety via map inflation.
+- `pathplan/` core: collision geometry (`geometry.py`), occupancy grid (`map_utils.py`), robot model and propagation (`robot.py`), motion primitives (`primitives.py`), heuristics (`heuristics.py`), planners (`hybrid_a_star.py`, `dqn_hybrid_a_star.py`, `rrt_star.py`, `apf.py`), DQN guidance stubs/torch loader (`dqn_models.py`), and exports (`__init__.py`).
+- `examples/run_demo.py` small scenarios (corridor, open field; parking helper included).
+- `examples/forest_scene.py` dense-forest benchmarks (4 presets) with plots + CSVs in timestamped folders.
+- `examples/train_dqn.py` minimal DQN training loop for guidance (PyTorch).
+- `requirements.txt` (NumPy) and `requirements-train.txt` (NumPy + PyTorch) keep dependencies explicit; `matplotlib` is optional for plots.
 
-## Included planners
+## Robot + collision model (ground truth from code)
 
-- **Hybrid A\***: Lattice-based search over SE(2) using fixed motion primitives (5 steering bins x forward/reverse). Reeds-Shepp-inspired admissible heuristic, cusp penalty for direction changes, and oriented box collision sampling along each primitive.
-- **DQN-guided multi-heuristic Hybrid A\***: Two synchronized queues (anchor + DQN) maintain completeness while biasing expansions with a learned value estimate and action-ranking policy. Optional `dqn_top_k` reduces branching for speed.
-- **Kinodynamic RRT\***: Samples poses (with goal bias), forward-simulates bicycle dynamics with bounded steering/velocity, rewires neighbors within a radius, and attempts straight-line goal connection when close.
-- **Artificial Potential Field (APF)**: Gradient-descent navigation on an attractive goal potential plus repulsive obstacle field, constrained by the Ackermann turning radius and footprint collision checks.
+- Ackermann params: `wheelbase=0.6 m`, `min_turn_radius=1.6 m` → `|steer| ≤ 0.359 rad` (`AckermannParams`).
+- Footprint: oriented rectangle `0.924 m x 0.740 m` shared by every planner (`OrientedBoxFootprint`).
+- Collision: `GridFootprintChecker` precomputes, per heading bin, all grid-cell centers that lie inside the footprint (optional `padding`). `collides_pose` tests those centers; `collides_path`/`motion_collides` sample poses along a segment at `collision_step`. This center-based test can visually graze obstacles; add padding or inflate the map for stricter clearance.
+- Maps: `GridMap` with world/grid transforms, random free-state sampling, occupancy patches for guidance, and simple inflation (`inflate`) for safety buffers.
 
-## Robot and environment model
+## Planners (defaults in constructors)
 
-- **Ackermann params**: wheelbase `0.6 m`, minimum turning radius `1.6 m` -> `|delta| <= 0.359 rad` (`AckermannParams`).
-- **Footprint**: oriented rectangle `0.924 m x 0.740 m` (`OrientedBoxFootprint`), shared by all planners.
-- **Collision checking**: oriented bounding-box sampling plus interpolated poses along each motion (`geometry.motion_collides`).
-- **Maps**: occupancy grid (`GridMap`) with world/grid conversions, inflation, random free-state sampling, and robot-aligned occupancy patches for DQN features.
+- **Hybrid A\*** (`HybridAStarPlanner`): 10 primitives (`default_primitives`, step `0.3 m`, reverse weight `1.2`), cusp penalty `0.2`, heading bins `72`, `collision_step=0.1`, goal tolerances `0.3 m / 15°`, heuristic = Reeds-Shepp-style lower bound. `xy_resolution` defaults to the map resolution unless overridden (forests use coarser `0.60 m`, 48 bins).
+- **DQN Hybrid A\*** (`DQNHybridAStarPlanner`): same lattice, dual queues (anchor + DQN). DQN branch uses lightweight hand-tuned `DQNGuidance` unless you swap in `TorchDQNGuidance`. Config: `dqn_top_k`, `dqn_weight`, `anchor_inflation`, `dqn_lead_threshold`, `max_dqn_streak`.
+- **RRT\*** (`RRTStarPlanner`): forward-simulate bicycle for `step_time=0.6 s` at `velocity=0.8 m/s`, goal bias `0.2`, neighbor radius `1.5 m`, goal tolerances `0.2 m / 15°`, connect threshold `1.0 m`, optional rewiring, `collision_step=map.resolution*0.5`, `theta_bins=72`, `lazy_collision` switch for goal-only checks.
+- **Artificial Potential Field** (`APFPlanner`): attractive + repulsive potentials over a precomputed obstacle distance map, curvature-limited heading rate, `collision_step` default `map.resolution*0.5` unless set. Can run coarse (point) collision via `coarse_collision=True` or use the footprint checker.
 
-## Project layout
-
-- `pathplan/__init__.py` - library exports (planners, robot params/state, footprint, grid map).
-- `pathplan/common.py` - utility math (angles, clamp, distance, lerp).
-- `pathplan/geometry.py` - footprint geometry, OBB collision, pose interpolation.
-- `pathplan/map_utils.py` - occupancy grid, inflation, sampling, local patches for DQN-guided features.
-- `pathplan/robot.py` - Ackermann params/state, primitive propagation, forward simulation.
-- `pathplan/primitives.py` - motion primitives and costs (10 defaults: 5 steering bins x {forward, reverse}).
-- `pathplan/heuristics.py` - Euclidean + heading penalty and Reeds-Shepp-style admissible lower bound.
-- `pathplan/hybrid_a_star.py` - classic Hybrid A* with cusp penalty and collision-checked primitives.
-- `pathplan/dqn_hybrid_a_star.py` - multi-queue Hybrid A* with DQN guidance for heuristics and action ordering.
-- `pathplan/dqn_models.py` - lightweight DQN-style value/policy using local occupancy patches (torch-optional stubs).
-- `pathplan/rrt_star.py` - kinodynamic RRT* with forward simulation, rewiring, and soft goal connection.
-- `pathplan/apf.py` - Artificial Potential Field baseline with gradient descent and curvature limits.
-- `examples/run_demo.py` - runnable scenarios exercising all planners.
-- `requirements.txt` - NumPy dependency pin.
-
-## Quickstart
+## Install & run
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt         # NumPy core
+pip install matplotlib                  # needed for plotting (optional)
+
+# Quick demo (corridor + open field)
 python -m examples.run_demo
 ```
 
-The demo builds synthetic maps and runs all planners on each:
-- Tight corridor with partial block (`make_corridor_map`)
-- Open field (`make_open_map`)
-Prints success, run time, path length, and search effort (expansions or node count). Add `make_parking_map` for a parking-bay stress test.
+Forest benchmarks (writes `examples/outputs/<timestamp>/`):
+```bash
+python -m examples.forest_scene --variant all
+# or: --variant large_map | small_map | large_gap | small_gap
+```
 
-## Train a Torch DQN guidance (CUDA)
+## Torch DQN guidance (optional)
 
-- Install training deps: `pip install -r requirements-train.txt` (installs PyTorch).
-- Run training (uses CUDA when available): `python -m examples.train_dqn --device cuda`.
-- Plug the trained model into the planner:
+- Install training deps: `pip install -r requirements-train.txt` (PyTorch).
+- Train: `python -m examples.train_dqn --device cuda` (auto-falls back to CPU).
+- Use in a planner:
   ```python
-  from pathplan import DQNHybridAStarPlanner, TorchDQNGuidance, AckermannParams
-  planner = DQNHybridAStarPlanner(grid_map, footprint, AckermannParams())
+  from pathplan import AckermannParams, DQNHybridAStarPlanner, OrientedBoxFootprint, TorchDQNGuidance
+  planner = DQNHybridAStarPlanner(grid_map, OrientedBoxFootprint(0.924, 0.740), AckermannParams())
   planner.dqn = TorchDQNGuidance(planner.params, "examples/outputs/dqn_guidance.pt", primitives=planner.primitives)
   ```
 
-## How each planner works (key settings)
-
-- **Hybrid A\*** (`HybridAStarPlanner`):
-  - Discretization: XY resolution `0.1 m`, `72` heading bins.
-  - Actions: 10 primitives (`0.3 m` step), reverse motions carry a slight cost multiplier; cusp penalty `0.2`.
-  - Heuristic: admissible Reeds-Shepp lower bound; goal tolerance `0.3 m` and `15 deg`.
-  - Collision: oriented-box sampling along each primitive (`collision_step=0.1 m`).
-
-- **DQN-guided Hybrid A\*** (`DQNHybridAStarPlanner`):
-  - Two queues: anchor uses admissible heuristic; DQN queue uses learned value + policy-ranked actions.
-  - DQN features from a local occupancy patch (robot frame), goal distance/heading, and occupancy statistics.
-  - Configurable `dqn_top_k` to limit branching; `dqn_weight` to scale the learned heuristic.
-
-- **RRT\*** (`RRTStarPlanner`):
-  - Forward simulate bicycle model for `0.6 s` at `0.8 m/s`; steering bounded by `max_steer`.
-  - Goal bias `20%`, neighbor radius `1.5 m`, connect-to-goal threshold `1.0 m`.
-  - Rewire neighbors when a cheaper kinodynamic connection is found; straight-line goal connection is collision-checked.
-- **Artificial Potential Field** (`APFPlanner`):
-  - Attractive quadratic potential toward the goal; repulsive barrier within `repulse_radius` meters of obstacles (precomputed distance field).
-  - Gradient descent with curvature-limited heading updates (`step_size` settable; heading change capped by min turning radius).
-  - Uses the oriented-box collision checker along each step; stalls or timeouts return failure (empty path) for fair benchmarking.
-
-## Example: plan on your own map
+## Minimal API example
 
 ```python
 import numpy as np
-from pathplan import (
-    AckermannParams, AckermannState, GridMap,
-    HybridAStarPlanner, OrientedBoxFootprint,
-)
+from pathplan import AckermannParams, AckermannState, GridMap, HybridAStarPlanner, OrientedBoxFootprint
 
-# Build a simple map (0 = free, 1 = occupied)
 grid = np.zeros((80, 120), dtype=np.uint8)
-grid[20:24, 30:90] = 1  # an obstacle band
+grid[20:24, 30:90] = 1  # obstacle band
 grid_map = GridMap(grid, resolution=0.05)
-
 params = AckermannParams()
 footprint = OrientedBoxFootprint(length=0.924, width=0.740)
 planner = HybridAStarPlanner(grid_map, footprint, params)
@@ -110,28 +70,21 @@ path, stats = planner.plan(start, goal, timeout=4.0)
 print("Success:", bool(path), "Expansions:", stats["expansions"], "Path length:", stats["path_length"])
 ```
 
-Swap in `DQNHybridAStarPlanner` for faster searches, or `RRTStarPlanner` for kinodynamic sampling-based planning.
+Swap in `DQNHybridAStarPlanner` for guided search or `RRTStarPlanner` for sampling-based planning.
 
-## Extending
+## Extending / safety knobs
 
-- **Safety margin**: `GridMap.inflate(margin)` to pad obstacles before planning.
-- **Actions**: customize steering bins/step length via `pathplan.primitives.default_primitives` or your own list.
-- **Heuristics**: replace `admissible_heuristic` for domain-specific lower bounds.
-- **DQN guidance**: drop in real models inside `dqn_models.DQNGuidance` (value/policy) or adjust patch size/features.
-- **Dynamics**: tweak `AckermannParams` for different vehicles (wheelbase, turning radius, velocity bounds).
+- Inflate obstacles: `GridMap.inflate(margin)` or add `padding` to `GridFootprintChecker` to make center-based collision conservative.
+- Change actions: `default_primitives(params, step_length, delta_scale)` or custom `MotionPrimitive` list.
+- Tune heuristics: replace `admissible_heuristic` in planners for domain-specific bounds.
+- Adjust fidelity: smaller `collision_step`, more `theta_bins` → stricter collision/heading resolution; larger values → faster/looser.
+- Dynamics: edit `AckermannParams` for different vehicles (wheelbase, turning radius, velocity limits).
 
 ## Outputs and metrics
 
-- **Hybrid A\***: `path` (list of poses), `stats` with `path_length`, `cusps` (placeholder), `expansions`, `time`, `timed_out`.
-- **DQN-guided Hybrid**: adds `expansions_anchor`, `expansions_dqn`, `expansions_total`.
-- **RRT\***: `path`, `nodes`, `iterations`, `time`, `success`.
+- Hybrid A*: `expansions`, `time`, `timed_out`, `path_length`, optional `trace_poses`/`trace_boxes` for plotting.
+- DQN Hybrid A*: adds `expansions_anchor`, `expansions_dqn`, `expansions_total`.
+- RRT*: `nodes`, `iterations`, `time`, `success`, `path`.
+- APF: `time`, `reached`, `timed_out`, `path_length` (path empty on failure).
 
-Use these to benchmark planners or to tune action sets and heuristics.
-
-## Reasons to choose this repo
-
-- Fair, reproducible comparisons: identical collision model, vehicle limits, and map handling across planners.
-- Clarity-first code: each module is short and ready to modify - ideal for teaching, prototyping, or papers.
-- Learning-friendly: DQN guidance hooks are present but optional; runs identically with just NumPy.
-- Lightweight and portable: no ROS; synthetic maps mean zero external assets.
-- Research-ready: exposes stats, tolerances, and hyperparameters so you can sweep settings or plug into your experiment harness.
+Quantitative CSVs and plots are written under `examples/outputs/` by the demos/benchmarks. Use these to benchmark, compare planners, or tune hyperparameters.
