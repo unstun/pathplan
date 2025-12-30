@@ -1,17 +1,17 @@
 """
 Dense forest scenario with many tree obstacles (flat terrain, no slopes).
 Four presets are available: large map, small map, large gap, small gap.
-Run, for example:
-    python -m examples.forest_scene --variant large_map
-    python -m examples.forest_scene --variant small_gap
-Use --variant all to generate every preset.
-The script prints planner stats and saves a plot to examples/outputs/.
+Run one command to generate all four maps and three planners each:
+    python -m examples.forest_scene --variant all
+Outputs (plots + CSV) are written to time-stamped folders in examples/outputs/.
 """
 
 import argparse
+import csv
 import os
 import math
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -345,8 +345,9 @@ def build_variant(variant: str):
     return variant_slug, title, map_kwargs, start, goal
 
 
-def plan_forest_scene(variant: str = "large_map"):
-    output_dir = Path(__file__).resolve().parent / "outputs"
+def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None):
+    output_dir = out_dir or (Path(__file__).resolve().parent / "outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
     variant_slug, title, map_kwargs, start, goal = build_variant(variant)
     grid_map = make_forest_map(**map_kwargs)
 
@@ -391,6 +392,7 @@ def plan_forest_scene(variant: str = "large_map"):
         ("RRT*", RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
     ]
 
+    records = []
     planner_results = []
     for label, planner in planners:
         t0 = time.time()
@@ -412,6 +414,17 @@ def plan_forest_scene(variant: str = "large_map"):
             f"{label}: success={success}, time={stats.get('time',0):.2f}s, "
             f"path_len={path_len:.2f}, expansions/nodes={expansions}"
         )
+        records.append(
+            {
+                "variant": variant_slug,
+                "planner": label,
+                "success": success,
+                "path_length": path_len,
+                "expansions_or_nodes": expansions,
+                "time": stats.get("time", 0.0),
+                "time_wall": stats.get("time_wall", 0.0),
+            }
+        )
         if success:
             planner_results.append((label, path, stats))
 
@@ -427,6 +440,10 @@ def plan_forest_scene(variant: str = "large_map"):
     )
     if saved_plot:
         print(f"Saved plot: {saved_plot}")
+        for rec in records:
+            rec["plot_path"] = str(saved_plot)
+
+    return records, saved_plot
 
 
 def parse_args():
@@ -436,14 +453,37 @@ def parse_args():
         default="large_map",
         help="Choose from: large_map, small_map, large_gap, small_gap, or 'all' to run every preset.",
     )
+    parser.add_argument(
+        "--out-root",
+        type=Path,
+        default=Path(__file__).resolve().parent / "outputs",
+        help="Base folder for results. A time-stamped subfolder is created inside.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    if args.variant.strip().lower() in ("all", "any"):
-        for variant_name in FOREST_VARIANTS:
-            print("\n" + "=" * 60)
-            plan_forest_scene(variant_name)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.out_root).expanduser().resolve() / run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Writing results to: {out_dir}")
+
+    all_records = []
+    variants = list(FOREST_VARIANTS) if args.variant.strip().lower() in ("all", "any") else [args.variant]
+    for variant_name in variants:
+        print("\n" + "=" * 60)
+        records, _ = plan_forest_scene(variant_name, out_dir=out_dir)
+        all_records.extend(records)
+
+    if all_records:
+        csv_path = out_dir / "results.csv"
+        fieldnames = ["variant", "planner", "success", "path_length", "expansions_or_nodes", "time", "time_wall", "plot_path"]
+        with csv_path.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in all_records:
+                writer.writerow(row)
+        print(f"\nSaved summary: {csv_path}")
     else:
-        plan_forest_scene(args.variant)
+        print("\nNo results to save.")

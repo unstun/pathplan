@@ -1,0 +1,13 @@
+variant,planner,success,path_length,expansions_or_nodes,time,time_wall,plot_path
+large_map,Hybrid A*,True,81.24101535936565,444,0.19250202178955078,0.19350504875183105,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_large_map.png
+large_map,DQN Hybrid A*,True,65.13916656469442,157,0.09527802467346191,0.09527802467346191,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_large_map.png
+large_map,RRT*,True,76.32699713409748,627,0.7861993312835693,0.7861993312835693,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_large_map.png
+small_map,Hybrid A*,True,30.080545010735204,117,0.04996776580810547,0.04996776580810547,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_small_map.png
+small_map,DQN Hybrid A*,True,22.771253306524564,58,0.033037424087524414,0.033037424087524414,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_small_map.png
+small_map,RRT*,True,26.733651627926378,29,0.011318683624267578,0.011318683624267578,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_small_map.png
+large_gap,Hybrid A*,True,51.21715130467546,385,0.20268487930297852,0.20268487930297852,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_large_gap.png
+large_gap,DQN Hybrid A*,True,41.78820787601315,1246,0.5073459148406982,0.5083432197570801,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_large_gap.png
+large_gap,RRT*,False,0.0,597,1.001579999923706,1.001579999923706,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_large_gap.png
+small_gap,Hybrid A*,True,51.21715130467546,385,0.16209077835083008,0.16209077835083008,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_small_gap.png
+small_gap,DQN Hybrid A*,True,50.90302006725994,1825,0.7377190589904785,0.7388145923614502,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_small_gap.png
+small_gap,RRT*,False,0.0,591,1.0005147457122803,1.0005147457122803,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.3\examples\outputs\20251229_171006\dense_forest_small_gap.png
