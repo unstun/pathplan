@@ -9,6 +9,7 @@ Exports planners:
 from .hybrid_a_star import HybridAStarPlanner
 from .dqn_hybrid_a_star import DQNHybridAStarPlanner
 from .rrt_star import RRTStarPlanner
+from .apf import APFPlanner
 from .robot import AckermannParams, AckermannState
 from .geometry import OrientedBoxFootprint
 from .map_utils import GridMap
@@ -18,6 +19,7 @@ __all__ = [
     "HybridAStarPlanner",
     "DQNHybridAStarPlanner",
     "RRTStarPlanner",
+    "APFPlanner",
     "AckermannParams",
     "AckermannState",
     "OrientedBoxFootprint",

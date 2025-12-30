@@ -13,6 +13,7 @@ from pathplan import (
     OrientedBoxFootprint,
     RRTStarPlanner,
     DQNHybridAStarPlanner,
+    APFPlanner,
 )
 
 try:
@@ -114,6 +115,7 @@ def run_scenario(
 
     print(f"\n=== Scenario: {name} ===")
     planners = [
+        ("Artificial Potential Field", APFPlanner(grid_map, footprint, params)),
         ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params)),
         ("DQN Hybrid A*", DQNHybridAStarPlanner(grid_map, footprint, params)),
         ("RRT*", RRTStarPlanner(grid_map, footprint, params)),

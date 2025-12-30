@@ -1,6 +1,6 @@
 # Path Planning Scaffold
 
-Python scaffold for benchmarking three Ackermann path planners under a consistent robot model (strict minimum turning radius and oriented rectangular footprint). Built to be hackable, lightweight, and fair for research experiments.
+Python scaffold for benchmarking Ackermann path planners (Hybrid A*, DQN-guided Hybrid A*, Artificial Potential Field, and kinodynamic RRT*) under a consistent robot model (strict minimum turning radius and oriented rectangular footprint). Built to be hackable, lightweight, and fair for research experiments.
 
 ## Why use this scaffold
 
@@ -15,6 +15,7 @@ Python scaffold for benchmarking three Ackermann path planners under a consisten
 - **Hybrid A\***: Lattice-based search over SE(2) using fixed motion primitives (5 steering bins x forward/reverse). Reeds-Shepp-inspired admissible heuristic, cusp penalty for direction changes, and oriented box collision sampling along each primitive.
 - **DQN-guided multi-heuristic Hybrid A\***: Two synchronized queues (anchor + DQN) maintain completeness while biasing expansions with a learned value estimate and action-ranking policy. Optional `dqn_top_k` reduces branching for speed.
 - **Kinodynamic RRT\***: Samples poses (with goal bias), forward-simulates bicycle dynamics with bounded steering/velocity, rewires neighbors within a radius, and attempts straight-line goal connection when close.
+- **Artificial Potential Field (APF)**: Gradient-descent navigation on an attractive goal potential plus repulsive obstacle field, constrained by the Ackermann turning radius and footprint collision checks.
 
 ## Robot and environment model
 
@@ -36,7 +37,8 @@ Python scaffold for benchmarking three Ackermann path planners under a consisten
 - `pathplan/dqn_hybrid_a_star.py` - multi-queue Hybrid A* with DQN guidance for heuristics and action ordering.
 - `pathplan/dqn_models.py` - lightweight DQN-style value/policy using local occupancy patches (torch-optional stubs).
 - `pathplan/rrt_star.py` - kinodynamic RRT* with forward simulation, rewiring, and soft goal connection.
-- `examples/run_demo.py` - runnable scenarios exercising all three planners.
+- `pathplan/apf.py` - Artificial Potential Field baseline with gradient descent and curvature limits.
+- `examples/run_demo.py` - runnable scenarios exercising all planners.
 - `requirements.txt` - NumPy dependency pin.
 
 ## Quickstart
@@ -79,6 +81,10 @@ Prints success, run time, path length, and search effort (expansions or node cou
   - Forward simulate bicycle model for `0.6 s` at `0.8 m/s`; steering bounded by `max_steer`.
   - Goal bias `20%`, neighbor radius `1.5 m`, connect-to-goal threshold `1.0 m`.
   - Rewire neighbors when a cheaper kinodynamic connection is found; straight-line goal connection is collision-checked.
+- **Artificial Potential Field** (`APFPlanner`):
+  - Attractive quadratic potential toward the goal; repulsive barrier within `repulse_radius` meters of obstacles (precomputed distance field).
+  - Gradient descent with curvature-limited heading updates (`step_size` settable; heading change capped by min turning radius).
+  - Uses the oriented-box collision checker along each step; stalls or timeouts return failure (empty path) for fair benchmarking.
 
 ## Example: plan on your own map
 

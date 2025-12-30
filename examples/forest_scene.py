@@ -1,7 +1,7 @@
 """
 Dense forest scenario with many tree obstacles (flat terrain, no slopes).
 Four presets are available: large map, small map, large gap, small gap.
-Run one command to generate all four maps and three planners each:
+Run one command to generate all four maps and four planners (APF, Hybrid A*, DQN Hybrid A*, RRT*):
     python -m examples.forest_scene --variant all
 Outputs (plots + CSV) are written to time-stamped folders in examples/outputs/.
 """
@@ -28,6 +28,7 @@ from pathplan import (
     OrientedBoxFootprint,
     DQNHybridAStarPlanner,
     RRTStarPlanner,
+    APFPlanner,
 )
 from pathplan.primitives import default_primitives
 
@@ -74,22 +75,27 @@ FOREST_VARIANTS = {
     "large_gap": {
         "title": "Forest (large gap)",
         "map_kwargs": {
-            "num_trees": 380,
-            "clearance": 1.6,
+            "num_trees": 240,
+            "clearance": 2.3,
         },
-        "gap_width": 8.0,
-        "wall_y_factor": 0.55,
     },
     "small_gap": {
         "title": "Forest (small gap)",
         "map_kwargs": {
-            "num_trees": 380,
-            "clearance": 1.6,
+            "num_trees": 500,
+            "clearance": 1.3,
         },
-        "gap_width": 3.0,
-        "wall_y_factor": 0.55,
     },
 }
+
+PATH_COLOR_MAP = {
+    "Artificial Potential Field": "#d81b60",  # bold red/magenta
+    "Hybrid A*": "#1f77b4",  # deep blue
+    "DQN Hybrid A*": "#2ca02c",  # strong green
+    "RRT*": "#ff7f0e",  # vivid orange
+}
+FALLBACK_COLORS = ["#6a3d9a", "#a6cee3", "#b2df8a"]  # purple plus high-contrast backups
+PRIMARY_LINEWIDTH = 3.6
 
 
 def compute_start_goal(map_kwargs):
@@ -117,6 +123,8 @@ def compute_start_goal(map_kwargs):
 DEFAULT_START, DEFAULT_GOAL = compute_start_goal(FOREST_MAP_KWARGS)
 
 # Planner budgets tuned for sub-second runs.
+APF_TIMEOUT = 3.0
+APF_MAX_ITERS = 8_000
 HYBRID_TIMEOUT = 1.0
 HYBRID_MAX_NODES = 8_000
 DQN_TIMEOUT = 1.0
@@ -220,7 +228,8 @@ def make_forest_map(
     if wall_y is not None:
         wall_r = wall_radius if wall_radius is not None else tree_radius * 1.05
         gap_center, gap_width = wall_gap
-        x_positions = np.arange(tree_radius + clearance, size[0] - tree_radius - clearance, wall_r * 2.0)
+        wall_spacing = max(wall_r * 2.0, tree_radius * 2.0 + clearance)
+        x_positions = np.arange(tree_radius + clearance, size[0] - tree_radius - clearance, wall_spacing)
         for x in x_positions:
             if abs(x - gap_center) < gap_width / 2.0:
                 continue
@@ -266,22 +275,37 @@ def plot_with_boxes(
 ):
     if plt is None or not planner_results:
         return None
-    fig, ax = plt.subplots(figsize=(24, 14))
+    fig, ax = plt.subplots(figsize=(24, 14), facecolor="white")
+    fig.subplots_adjust(right=0.98, left=0.06, top=0.98, bottom=0.08)
+    ax.set_facecolor("white")
     h, w = grid_map.data.shape
+    res = grid_map.resolution
+    ox, oy = grid_map.origin
     extent = [
-        grid_map.origin[0],
-        grid_map.origin[0] + w * grid_map.resolution,
-        grid_map.origin[1],
-        grid_map.origin[1] + h * grid_map.resolution,
+        ox - res * 0.5,
+        ox + w * res - res * 0.5,
+        oy - res * 0.5,
+        oy + h * res - res * 0.5,
     ]
-    ax.imshow(grid_map.data, cmap="gray_r", origin="lower", extent=extent, vmin=0, vmax=1)
-    ax.scatter(start.x, start.y, c="green", marker="*", s=120, label="start")
-    ax.scatter(goal.x, goal.y, c="red", marker="*", s=120, label="goal")
+    ax.imshow(
+        grid_map.data,
+        cmap="gray_r",
+        origin="lower",
+        extent=extent,
+        vmin=0,
+        vmax=1,
+        alpha=1.0,
+        interpolation="nearest",
+    )
+    ax.scatter(start.x, start.y, c="#008000", marker="*", s=1760, label="start", edgecolors="black", linewidths=0)
+    ax.scatter(goal.x, goal.y, c="#c8102e", marker="*", s=1760, label="goal", edgecolors="black", linewidths=0)
 
-    for label, path, stats in planner_results:
+    color_cycle = list(PATH_COLOR_MAP.values()) + FALLBACK_COLORS
+    for idx, (label, path, stats) in enumerate(planner_results):
+        color = PATH_COLOR_MAP.get(label, color_cycle[idx % len(color_cycle)])
         xs = [p.x for p in path]
         ys = [p.y for p in path]
-        ax.plot(xs, ys, linewidth=2.2, label=label)
+        ax.plot(xs, ys, linewidth=PRIMARY_LINEWIDTH, color=color, solid_capstyle="round", label=label)
         boxes = stats.get("trace_boxes", [])
         if not boxes and path:
             boxes = [footprint.corners(p.x, p.y, p.theta) for p in path]
@@ -290,7 +314,7 @@ def plot_with_boxes(
             stride = max(1, len(boxes) // 40)
             for box in boxes[::stride]:
                 bx, by = zip(*(box + [box[0]]))
-                ax.plot(bx, by, linewidth=1.0, alpha=0.7)
+                ax.plot(bx, by, linewidth=1.0, alpha=0.45, color=color)
         if path:
             heading = path[-1]
             ax.arrow(
@@ -300,15 +324,18 @@ def plot_with_boxes(
                 0.4 * math.sin(heading.theta),
                 head_width=0.15,
                 head_length=0.2,
-                fc="k",
-                ec="k",
-                alpha=0.9,
+                fc=color,
+                ec=color,
+                alpha=0.85,
                 length_includes_head=True,
             )
 
     ax.set_aspect("equal")
-    ax.set_title(name)
-    ax.legend(loc="upper right")
+    ax.legend(loc="upper left", fontsize=16)
+    ax.tick_params(length=0, labelsize=14)
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.patch.set_facecolor("white")
     out_dir.mkdir(parents=True, exist_ok=True)
     safe_slug = variant_slug or "default"
     out_path = out_dir / f"dense_forest_{safe_slug}.png"
@@ -330,14 +357,6 @@ def build_variant(variant: str):
     cfg = FOREST_VARIANTS[variant_slug]
     map_kwargs = dict(FOREST_MAP_KWARGS)
     map_kwargs.update(cfg.get("map_kwargs", {}))
-
-    if variant_slug in ("large_gap", "small_gap"):
-        size_x, size_y = map_kwargs["size"]
-        map_kwargs["wall_y"] = cfg.get("wall_y_factor", 0.5) * size_y
-        gap_width = cfg.get("gap_width", map_kwargs.get("wall_gap", (size_x * 0.5, 4.0))[1])
-        map_kwargs["wall_gap"] = (size_x * 0.5, gap_width)
-        if map_kwargs.get("wall_radius") is None:
-            map_kwargs["wall_radius"] = map_kwargs.get("tree_radius", 0.30) * 1.05
 
     start, goal = compute_start_goal(map_kwargs)
     map_kwargs["keep_clear"] = [(start.x, start.y), (goal.x, goal.y)]
@@ -386,7 +405,23 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
         rewire=False,
         theta_bins=48,
     )
+    apf_kwargs = dict(
+        step_size=0.3,
+        goal_tol=1.0,
+        repulse_radius=0.8,
+        obstacle_gain=0.6,
+        goal_gain=1.5,
+        max_iters=APF_MAX_ITERS,
+        collision_step=0.10,
+        stall_steps=200,
+        theta_bins=48,
+        min_step=0.01,
+        jitter_angle=1.0,
+        heading_rate=1.0,
+        coarse_collision=True,
+    )
     planners = [
+        ("Artificial Potential Field", APFPlanner(grid_map, footprint, params, **apf_kwargs)),
         ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **hybrid_kwargs)),
         ("DQN Hybrid A*", DQNHybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **dqn_kwargs)),
         ("RRT*", RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
@@ -398,10 +433,14 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
         t0 = time.time()
         if isinstance(planner, RRTStarPlanner):
             path, stats = planner.plan(start, goal, max_iter=RRT_MAX_ITER, timeout=RRT_TIMEOUT)
+        elif isinstance(planner, DQNHybridAStarPlanner):
+            path, stats = planner.plan(start, goal, timeout=DQN_TIMEOUT, max_nodes=DQN_MAX_NODES)
         elif isinstance(planner, HybridAStarPlanner):
             path, stats = planner.plan(start, goal, timeout=HYBRID_TIMEOUT, max_nodes=HYBRID_MAX_NODES)
+        elif isinstance(planner, APFPlanner):
+            path, stats = planner.plan(start, goal, timeout=APF_TIMEOUT)
         else:
-            path, stats = planner.plan(start, goal, timeout=DQN_TIMEOUT, max_nodes=DQN_MAX_NODES)
+            path, stats = planner.plan(start, goal)
         stats["time_wall"] = time.time() - t0
         success = len(path) > 0
         expansions = stats.get("expansions", stats.get("expansions_total", stats.get("nodes", "-")))

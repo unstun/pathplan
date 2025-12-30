@@ -1,0 +1,17 @@
+variant,planner,success,path_length,expansions_or_nodes,time,time_wall,plot_path
+large_map,Artificial Potential Field,True,68.56812056839482,226,0.29691004753112793,0.2969527244567871,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_map.png
+large_map,Hybrid A*,True,81.24101535936565,444,0.1837301254272461,0.18407869338989258,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_map.png
+large_map,DQN Hybrid A*,True,65.91350417524862,105,0.03849434852600098,0.0385587215423584,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_map.png
+large_map,RRT*,True,76.32699713409748,627,0.5383002758026123,0.5383436679840088,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_map.png
+small_map,Artificial Potential Field,True,25.703308560151065,83,0.06459188461303711,0.06461167335510254,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_map.png
+small_map,Hybrid A*,True,30.080545010735204,117,0.04803180694580078,0.04811668395996094,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_map.png
+small_map,DQN Hybrid A*,True,22.771253306524567,46,0.017758846282958984,0.01781296730041504,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_map.png
+small_map,RRT*,True,26.73365162792638,29,0.010433673858642578,0.010443449020385742,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_map.png
+large_gap,Artificial Potential Field,True,43.87126196104833,143,0.12448930740356445,0.12451434135437012,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_gap.png
+large_gap,Hybrid A*,True,51.31992849910311,214,0.09105992317199707,0.0912327766418457,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_gap.png
+large_gap,DQN Hybrid A*,True,40.19377251448569,73,0.025878190994262695,0.02593851089477539,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_gap.png
+large_gap,RRT*,True,41.07715711235943,88,0.019807815551757812,0.01981663703918457,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_large_gap.png
+small_gap,Artificial Potential Field,True,46.76641950449538,153,0.12194466590881348,0.12197399139404297,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_gap.png
+small_gap,Hybrid A*,True,51.247452331541595,248,0.09391641616821289,0.09411334991455078,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_gap.png
+small_gap,DQN Hybrid A*,True,45.3225003506206,139,0.043210744857788086,0.04329252243041992,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_gap.png
+small_gap,RRT*,False,0.0,564,1.00050687789917,1.000544548034668,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251230_180814\dense_forest_small_gap.png

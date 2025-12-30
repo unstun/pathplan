@@ -53,6 +53,8 @@ class DQNHybridAStarPlanner:
         dqn_top_k: Optional[int] = None,
         anchor_inflation: float = 1.0,
         dqn_weight: float = 1.0,
+        dqn_lead_threshold: float = 1.0,
+        max_dqn_streak: int = 3,
     ):
         self.map = grid_map
         self.footprint = footprint
@@ -66,6 +68,8 @@ class DQNHybridAStarPlanner:
         self.dqn_top_k = dqn_top_k
         self.anchor_inflation = anchor_inflation
         self.dqn_weight = dqn_weight
+        self.dqn_lead_threshold = dqn_lead_threshold
+        self.max_dqn_streak = max(1, max_dqn_streak)
         self.dqn = DQNGuidance(params)
         self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
@@ -116,21 +120,25 @@ class DQNHybridAStarPlanner:
         visited: Dict[Tuple[int, int, int], float] = {}
         expansions_anchor = 0
         expansions_dqn = 0
-        iterations = 0
         counter = 1
+        dqn_streak = 0
 
         while (anchor_heap or dqn_heap) and (time.time() - start_time) < timeout and (
             expansions_anchor + expansions_dqn
         ) < max_nodes:
-            # Alternate between anchor and DQN to preserve coverage.
-            iterations += 1
+            # Prefer DQN only when its best candidate is better; cap consecutive DQN pops to avoid anchor starvation.
             use_anchor = True
-            if iterations % 2 == 1 and dqn_heap:
+            if anchor_heap and dqn_heap:
+                anchor_key = anchor_heap[0][0]
+                dqn_key = dqn_heap[0][0]
+                dqn_leads = dqn_key <= anchor_key * self.dqn_lead_threshold
+                if dqn_leads and dqn_streak < self.max_dqn_streak:
+                    use_anchor = False
+            elif not anchor_heap and dqn_heap:
                 use_anchor = False
-            if not anchor_heap:
-                use_anchor = False
-            if not dqn_heap:
+            elif not dqn_heap and anchor_heap:
                 use_anchor = True
+
             heap = anchor_heap if use_anchor else dqn_heap
             _, _, current = heapq.heappop(heap)
             key = self._discretize(current.state)
@@ -161,9 +169,11 @@ class DQNHybridAStarPlanner:
 
             if use_anchor:
                 expansions_anchor += 1
+                dqn_streak = 0
                 actions = list(self.primitives)
             else:
                 expansions_dqn += 1
+                dqn_streak += 1
                 scores = self.dqn.policy_from_eval(
                     current.dqn_features,
                     current.dqn_heading_err,
