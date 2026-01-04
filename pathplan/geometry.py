@@ -53,7 +53,7 @@ class OrientedBoxFootprint:
     ) -> bool:
         """Collision test by sampling grid cell centers within bounding square."""
         radius = math.hypot(self.half_length, self.half_width)
-        step = max(sample_step, grid_map.resolution * 0.5)
+        step = max(sample_step, 1e-6)
         minx = x - radius
         maxx = x + radius
         miny = y - radius

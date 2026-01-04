@@ -5,7 +5,7 @@ from typing import List, Tuple
 
 import numpy as np
 
-from .common import clamp, heading_diff, wrap_angle
+from .common import clamp, heading_diff, wrap_angle, default_collision_step, default_min_motion_step
 from .geometry import GridFootprintChecker
 from .robot import AckermannParams, AckermannState
 
@@ -17,7 +17,7 @@ class APFPlanner:
         footprint,
         params: AckermannParams,
         step_size: float = 0.2,
-        goal_tol: float = 0.3,
+        goal_tol: float = 0.1,
         repulse_radius: float = 0.8,
         obstacle_gain: float = 0.8,
         goal_gain: float = 1.0,
@@ -41,9 +41,10 @@ class APFPlanner:
         self.goal_gain = goal_gain
         self.max_iters = max_iters
         self.gradient_eps = gradient_eps if gradient_eps is not None else grid_map.resolution
-        self.collision_step = collision_step if collision_step is not None else grid_map.resolution * 0.5
+        base_step = default_collision_step(grid_map.resolution)
+        self.collision_step = collision_step if collision_step is not None else base_step
         self.stall_steps = max(1, int(stall_steps))
-        self.min_step = min_step if min_step is not None else grid_map.resolution * 0.5
+        self.min_step = min_step if min_step is not None else default_min_motion_step(grid_map.resolution)
         self.jitter_angle = jitter_angle
         self._jitter_sign = 1.0
         self.heading_rate = heading_rate if heading_rate is not None else self.step_size / max(self.params.min_turn_radius, 1e-6)

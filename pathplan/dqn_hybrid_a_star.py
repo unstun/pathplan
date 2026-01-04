@@ -4,7 +4,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from .common import heading_diff
+from .common import heading_diff, default_collision_step
 from .geometry import GridFootprintChecker
 from .heuristics import admissible_heuristic
 from .primitives import MotionPrimitive, default_primitives, primitive_cost
@@ -47,9 +47,9 @@ class DQNHybridAStarPlanner:
         primitives: Optional[List[MotionPrimitive]] = None,
         xy_resolution: Optional[float] = None,
         theta_bins: int = 72,
-        collision_step: float = 0.1,
-        goal_xy_tol: float = 0.3,
-        goal_theta_tol: float = math.radians(15.0),
+        collision_step: Optional[float] = None,
+        goal_xy_tol: float = 0.1,
+        goal_theta_tol: float = math.radians(5.0),
         dqn_top_k: Optional[int] = None,
         anchor_inflation: float = 1.0,
         dqn_weight: float = 1.0,
@@ -62,7 +62,7 @@ class DQNHybridAStarPlanner:
         self.primitives = primitives if primitives is not None else default_primitives(params)
         self.xy_resolution = xy_resolution if xy_resolution is not None else grid_map.resolution
         self.theta_bins = theta_bins
-        self.collision_step = collision_step
+        self.collision_step = collision_step if collision_step is not None else default_collision_step(grid_map.resolution)
         self.goal_xy_tol = goal_xy_tol
         self.goal_theta_tol = goal_theta_tol
         self.dqn_top_k = dqn_top_k

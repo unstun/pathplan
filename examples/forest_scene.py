@@ -30,6 +30,7 @@ from pathplan import (
     RRTStarPlanner,
     APFPlanner,
 )
+from pathplan.common import default_collision_step
 from pathplan.primitives import default_primitives
 
 try:
@@ -39,7 +40,7 @@ except ImportError:
 
 # Base defaults used by all presets and the interactive editor.
 FOREST_MAP_KWARGS = dict(
-    resolution=0.10,
+    resolution=0.1,
     size=(40.0, 28.0),
     num_trees=400,  # dense but still navigable
     tree_radius=0.30,
@@ -60,7 +61,6 @@ FOREST_VARIANTS = {
             "size": (64.0, 40.0),
             "num_trees": 750,
             "clearance": 1.8,
-            "resolution": 0.10,
         },
     },
     "small_map": {
@@ -69,7 +69,6 @@ FOREST_VARIANTS = {
             "size": (24.0, 16.0),
             "num_trees": 180,
             "clearance": 1.5,
-            "resolution": 0.08,
         },
     },
     "large_gap": {
@@ -120,17 +119,26 @@ def compute_start_goal(map_kwargs):
     return start, goal
 
 
+def adaptive_goal_tolerances(grid_map: GridMap, footprint: OrientedBoxFootprint, collision_step: float) -> Tuple[float, float]:
+    """
+    Fixed goal tolerances for the benchmarks.
+    """
+    goal_xy_tol = 0.1
+    goal_theta_tol = math.radians(5.0)
+    return goal_xy_tol, goal_theta_tol
+
+
 DEFAULT_START, DEFAULT_GOAL = compute_start_goal(FOREST_MAP_KWARGS)
 
 # Planner budgets tuned for sub-second runs.
-APF_TIMEOUT = 3.0
-APF_MAX_ITERS = 8_000
-HYBRID_TIMEOUT = 1.0
+APF_TIMEOUT = 4.0
+APF_MAX_ITERS = 12_000
+HYBRID_TIMEOUT = 1.5
 HYBRID_MAX_NODES = 8_000
 DQN_TIMEOUT = 1.0
 DQN_MAX_NODES = 8_000
-RRT_TIMEOUT = 1.0
-RRT_MAX_ITER = 20_000
+RRT_TIMEOUT = 5.0
+RRT_MAX_ITER = 30_000
 
 
 def make_forest_map(
@@ -369,6 +377,13 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
     output_dir.mkdir(parents=True, exist_ok=True)
     variant_slug, title, map_kwargs, start, goal = build_variant(variant)
     grid_map = make_forest_map(**map_kwargs)
+    size_x, size_y = map_kwargs["size"]
+    is_large_map = max(size_x, size_y) > 30.0
+    params = AckermannParams()
+    footprint = OrientedBoxFootprint(length=0.924, width=0.740)
+    base_collision_step = default_collision_step(grid_map.resolution, preferred=0.20, max_step=0.25)
+    apf_collision_step = default_collision_step(grid_map.resolution, preferred=0.12, max_step=0.20)
+    goal_xy_tol, goal_theta_tol = adaptive_goal_tolerances(grid_map, footprint, base_collision_step)
 
     print(
         f"Variant '{variant_slug}': size={map_kwargs['size']} m, "
@@ -377,48 +392,49 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
     if map_kwargs.get("wall_y") is not None:
         gap_center, gap_width = map_kwargs["wall_gap"]
         print(f"  Wall at y={map_kwargs['wall_y']:.2f} with gap center={gap_center:.2f}, width={gap_width:.2f}")
+    print(
+        f"  Goal tolerance: xy<={goal_xy_tol:.2f} m, theta<={math.degrees(goal_theta_tol):.1f} deg "
+        f"(auto from resolution {grid_map.resolution:.2f} m)"
+    )
 
-    params = AckermannParams()
-    footprint = OrientedBoxFootprint(length=0.924, width=0.740)
     short_primitives = default_primitives(params, step_length=1.0)
     base_kwargs = dict(
         xy_resolution=0.60,
-        collision_step=0.20,
-        goal_xy_tol=1.5,
-        goal_theta_tol=math.pi,
+        collision_step=base_collision_step,
+        goal_xy_tol=goal_xy_tol,
+        goal_theta_tol=goal_theta_tol,
         theta_bins=48,
     )
     hybrid_kwargs = dict(base_kwargs, heuristic_weight=2.2)
     dqn_kwargs = dict(base_kwargs, dqn_top_k=3, anchor_inflation=2.0, dqn_weight=1.3)
     rrt_kwargs = dict(
-        goal_sample_rate=0.55,  # lower bias to escape blocked goal rays faster
-        neighbor_radius=3.5,
-        step_time=1.40,  # longer rollout per sample = fewer iterations to reach the goal
-        velocity=1.40,
-        connect_threshold=5.0,
-        goal_xy_tol=0.8,
-        goal_theta_tol=math.pi,
+        goal_sample_rate=0.80 if is_large_map else 0.70,  # stronger bias for large scenes
+        neighbor_radius=5.0 if is_large_map else 4.0,
+        step_time=1.20 if is_large_map else 0.90,  # longer rollout on large maps, shorter on small
+        velocity=1.0,
+        goal_xy_tol=max(goal_xy_tol, 0.40 if is_large_map else 0.25),
+        goal_theta_tol=max(goal_theta_tol, math.radians(45.0 if is_large_map else 15.0)),
         goal_check_freq=1,
-        seed_steps=30,
-        collision_step=0.20,
-        lazy_collision=False,  # full motion collision checking (still sub-second with the longer step_time)
+        seed_steps=0,
+        collision_step=default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25),
+        lazy_collision=False,
         rewire=False,
         theta_bins=48,
     )
     apf_kwargs = dict(
-        step_size=0.3,
-        goal_tol=1.0,
-        repulse_radius=0.8,
-        obstacle_gain=0.6,
-        goal_gain=1.5,
+        step_size=0.25,
+        goal_tol=max(goal_xy_tol, 0.2),
+        repulse_radius=1.1,
+        obstacle_gain=1.0,
+        goal_gain=1.2,
         max_iters=APF_MAX_ITERS,
-        collision_step=0.10,
-        stall_steps=200,
-        theta_bins=48,
-        min_step=0.01,
+        collision_step=apf_collision_step,
+        stall_steps=80,
+        theta_bins=64,
+        min_step=0.05,
         jitter_angle=1.0,
-        heading_rate=1.0,
-        coarse_collision=True,
+        heading_rate=0.8,
+        coarse_collision=False,
     )
     planners = [
         ("Artificial Potential Field", APFPlanner(grid_map, footprint, params, **apf_kwargs)),

@@ -19,10 +19,10 @@ Python scaffold for Ackermann planners (Hybrid A*, DQN-guided Hybrid A*, Artific
 
 ## Planners (defaults in constructors)
 
-- **Hybrid A\*** (`HybridAStarPlanner`): 10 primitives (`default_primitives`, step `0.3 m`, reverse weight `1.2`), cusp penalty `0.2`, heading bins `72`, `collision_step=0.1`, goal tolerances `0.3 m / 15°`, heuristic = Reeds-Shepp-style lower bound. `xy_resolution` defaults to the map resolution unless overridden (forests use coarser `0.60 m`, 48 bins).
+- **Hybrid A\*** (`HybridAStarPlanner`): 10 primitives (`default_primitives`, step `0.3 m`, reverse weight `1.2`), cusp penalty `0.2`, heading bins `72`, `collision_step≈0.1 m` (clamped), goal tolerances `0.1 m / 5°`, heuristic = Reeds-Shepp-style lower bound. `xy_resolution` defaults to the map resolution unless overridden (forests use coarser `0.60 m`, 48 bins).
 - **DQN Hybrid A\*** (`DQNHybridAStarPlanner`): same lattice, dual queues (anchor + DQN). DQN branch uses lightweight hand-tuned `DQNGuidance` unless you swap in `TorchDQNGuidance`. Config: `dqn_top_k`, `dqn_weight`, `anchor_inflation`, `dqn_lead_threshold`, `max_dqn_streak`.
-- **RRT\*** (`RRTStarPlanner`): forward-simulate bicycle for `step_time=0.6 s` at `velocity=0.8 m/s`, goal bias `0.2`, neighbor radius `1.5 m`, goal tolerances `0.2 m / 15°`, connect threshold `1.0 m`, optional rewiring, `collision_step=map.resolution*0.5`, `theta_bins=72`, `lazy_collision` switch for goal-only checks.
-- **Artificial Potential Field** (`APFPlanner`): attractive + repulsive potentials over a precomputed obstacle distance map, curvature-limited heading rate, `collision_step` default `map.resolution*0.5` unless set. Can run coarse (point) collision via `coarse_collision=True` or use the footprint checker.
+- **RRT\*** (`RRTStarPlanner`): forward-simulate bicycle for `step_time=0.6 s` at `velocity=0.8 m/s`, goal bias `0.2`, neighbor radius `1.5 m`, goal tolerances `0.1 m / 5°`, optional rewiring, `collision_step` uses the shared default, `theta_bins=72`, `lazy_collision` switch for goal-only checks.
+- **Artificial Potential Field** (`APFPlanner`): attractive + repulsive potentials over a precomputed obstacle distance map, curvature-limited heading rate, `collision_step` uses the shared default. Can run coarse (point) collision via `coarse_collision=True` or use the footprint checker.
 
 ## Install & run
 

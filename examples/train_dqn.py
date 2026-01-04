@@ -10,7 +10,7 @@ import random
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Deque, List, Tuple
+from typing import Deque, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 from pathplan import AckermannParams, AckermannState, GridMap, OrientedBoxFootprint
-from pathplan.common import heading_diff
+from pathplan.common import heading_diff, default_collision_step
 from pathplan.dqn_models import ConvGuidanceNet, TorchGuidanceFeatures
 from pathplan.geometry import GridFootprintChecker
 from pathplan.primitives import default_primitives, primitive_cost
@@ -128,7 +128,7 @@ class DQNEnv:
         patch_size: float = 6.0,
         patch_cells: int = 24,
         max_steps: int = 120,
-        collision_step: float = 0.1,
+        collision_step: Optional[float] = None,
     ):
         self.rng = np.random.default_rng(seed)
         self.params = AckermannParams()
@@ -137,7 +137,8 @@ class DQNEnv:
         self.patch_size = patch_size
         self.patch_cells = patch_cells
         self.max_steps = max_steps
-        self.collision_step = collision_step
+        self._collision_step_override = collision_step
+        self.collision_step = collision_step if collision_step is not None else 0.0
         self.map = None
         self.goal = None
         self.state = None
@@ -160,11 +161,13 @@ class DQNEnv:
         return math.hypot(dx, dy)
 
     def _goal_reached(self, state: AckermannState) -> bool:
-        return self._goal_dist(state) <= 0.4 and abs(heading_diff(self.goal.theta, state.theta)) <= math.radians(20)
+        return self._goal_dist(state) <= 0.1 and abs(heading_diff(self.goal.theta, state.theta)) <= math.radians(5.0)
 
     def reset(self) -> TorchGuidanceFeatures:
         self.map = self._sample_map()
         self.collision_checker = GridFootprintChecker(self.map, self.footprint, theta_bins=72)
+        base_step = default_collision_step(self.map.resolution)
+        self.collision_step = self._collision_step_override if self._collision_step_override is not None else base_step
         self.state = AckermannState(*self.map.random_free_state(self.rng))
         for _ in range(100):
             gx, gy, gtheta = self.map.random_free_state(self.rng)
