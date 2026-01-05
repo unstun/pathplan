@@ -1,0 +1,15 @@
+bounds: min_x=-35.57937792469317, min_y=-8.541080032918341, max_x=7.589377924693176, max_y=15.221080032918355
+shape: ny=238, nx=432
+resolution: 0.1
+rotation_z_deg: 13.8
+min_points_base: 1
+min_points_strict: 3
+roughness_thresh: 0.2
+map_a_points_as_free: True
+morph_open: 1
+morph_close: 1
+min_obs_cells: 16
+roughness_median_size: 3
+default_map: map_c
+variants: map_a, map_b, map_c, map_d
+z_filter: [None, None]

@@ -8,6 +8,7 @@ Python scaffold for Ackermann planners (APF, Hybrid A*, D-Hybrid A* (DQN-guided 
 - `examples/run_demo.py` small scenarios (corridor, open field; parking helper included).
 - `examples/forest_scene.py` dense-forest benchmarks (4 presets) with plots + CSVs in timestamped folders.
 - `examples/train_dqn.py` minimal DQN training loop for guidance (PyTorch).
+- `real_env1/` real SLAM forest point cloud segmentation -> occupancy grids/ROS maps; see `real_env1/README.md`.
 - `requirements.txt` (NumPy) and `requirements-train.txt` (NumPy + PyTorch) keep dependencies explicit; `matplotlib` is optional for plots.
 
 ## Robot + collision model (ground truth from code)
@@ -29,6 +30,7 @@ Python scaffold for Ackermann planners (APF, Hybrid A*, D-Hybrid A* (DQN-guided 
 ```bash
 pip install -r requirements.txt         # NumPy core
 pip install matplotlib                  # needed for plotting (optional)
+pip install -r requirements-real-env.txt  # optional: real forest SLAM map pipeline (laspy, scipy, tqdm, matplotlib)
 
 # Quick demo (corridor + open field)
 python -m examples.run_demo

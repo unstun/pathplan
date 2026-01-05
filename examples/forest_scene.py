@@ -1,19 +1,20 @@
 """
 Dense forest scenario with many tree obstacles (flat terrain, no slopes).
-Four presets are available: large map with large gap, large map with small gap,
-small map with large gap, small map with small gap.
-Run one command to generate all four maps and four planners
-(APF, Hybrid A*, D-Hybrid A*, Informed RRT*):
+Five presets are available: the four synthetic variants (large/small maps with large/small gaps)
+plus the real_env1 map built from the real SLAM occupancy grid.
+Run one command to generate every preset and planner (APF, Hybrid A*, D-Hybrid A*, Informed RRT*):
     python -m examples.forest_scene --variant all
 Outputs (plots + CSV) are written to time-stamped folders in examples/outputs/.
 """
 
 import argparse
+import ast
 import csv
 import os
 import math
 import time
 import sys
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -35,6 +36,7 @@ from pathplan import (
     feng_optimize_path,
     stomp_optimize_path,
 )
+from pathplan.geometry import GridFootprintChecker
 from pathplan.common import default_collision_step
 from pathplan.primitives import default_primitives
 
@@ -66,6 +68,11 @@ FOREST_MAP_KWARGS = dict(
     wall_radius=0.10,
     protected_path=None,
 )
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+REAL_ENV1_DIR = REPO_ROOT / "real_env1"
+REAL_ENV1_GRID = REAL_ENV1_DIR / "grid_out" / "occupancy.npy"
+REAL_ENV1_MAP_YAML = REAL_ENV1_DIR / "grid_out" / "map_c.yaml"
 
 FOREST_VARIANTS = {
     "large_map_large_gap": {
@@ -99,6 +106,12 @@ FOREST_VARIANTS = {
             "num_trees": 180,
             "clearance": 1.5,
         },
+    },
+    "real_env1": {
+        "title": "Real forest (SLAM occupancy, real_env1)",
+        "loader": "real_env1",
+        "grid_path": REAL_ENV1_GRID,
+        "yaml_path": REAL_ENV1_MAP_YAML,
     },
 }
 
@@ -159,6 +172,62 @@ def max_xy_deviation(a: List[AckermannState], b: List[AckermannState], samples: 
     return float(np.linalg.norm(pts_a - pts_b, axis=1).max())
 
 
+def reorient_path_headings(path: List[AckermannState]) -> List[AckermannState]:
+    """
+    Align headings to the forward segment direction to avoid arc reconstruction
+    cutting corners during postprocessing.
+    """
+    if not path:
+        return []
+    aligned: List[AckermannState] = []
+    for i, pose in enumerate(path):
+        if i + 1 < len(path):
+            nxt = path[i + 1]
+            heading = math.atan2(nxt.y - pose.y, nxt.x - pose.x)
+        elif aligned:
+            heading = aligned[-1].theta
+        else:
+            heading = pose.theta
+        aligned.append(AckermannState(pose.x, pose.y, heading))
+    return aligned
+
+
+def laplacian_smooth_path(
+    path: List[AckermannState],
+    checker: GridFootprintChecker,
+    ds_check: float,
+    *,
+    alpha: float = 0.18,
+    passes: int = 4,
+) -> Tuple[List[AckermannState], bool]:
+    """
+    Lightweight Laplacian smoothing on XY positions with collision checks.
+    Keeps endpoints fixed and re-computes headings from neighboring points.
+    """
+    if len(path) < 3 or alpha <= 0.0 or passes <= 0:
+        return list(path), False
+    smoothed = list(path)
+    for _ in range(passes):
+        updated: List[AckermannState] = [smoothed[0]]
+        for i in range(1, len(smoothed) - 1):
+            prev_p = smoothed[i - 1]
+            curr = smoothed[i]
+            nxt = smoothed[i + 1]
+            x = curr.x + alpha * ((prev_p.x + nxt.x) - 2.0 * curr.x)
+            y = curr.y + alpha * ((prev_p.y + nxt.y) - 2.0 * curr.y)
+            heading = math.atan2(nxt.y - prev_p.y, nxt.x - prev_p.x)
+            updated.append(AckermannState(x, y, heading))
+        last = smoothed[-1]
+        updated.append(AckermannState(last.x, last.y, last.theta))
+        smoothed = updated
+    if checker.collides_path(smoothed):
+        return list(path), False
+    for a, b in zip(smoothed[:-1], smoothed[1:]):
+        if checker.motion_collides(a.as_tuple(), b.as_tuple(), step=ds_check):
+            return list(path), False
+    return smoothed, True
+
+
 def compute_start_goal(map_kwargs):
     """
     Derive start/goal inside the map bounds from the map settings.
@@ -179,6 +248,125 @@ def compute_start_goal(map_kwargs):
         0.0,
     )
     return start, goal
+
+
+def parse_ros_map_yaml(yaml_path: Path) -> Tuple[float, Tuple[float, float]]:
+    """Minimal parser for a ROS map YAML to extract resolution and origin."""
+    txt = yaml_path.read_text(encoding="utf-8")
+    data = {}
+    for line in txt.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        data[key.strip()] = val.strip()
+    try:
+        resolution = float(data["resolution"])
+        origin = ast.literal_eval(data["origin"])
+        origin_xy = (float(origin[0]), float(origin[1]))
+    except Exception as exc:  # pragma: no cover - defensive parse
+        raise ValueError(f"Failed to parse ROS map YAML {yaml_path}: {exc}") from exc
+    return resolution, origin_xy
+
+
+def farthest_free_cells(free_mask: np.ndarray) -> Tuple[Tuple[int, int], Tuple[int, int], int, int]:
+    """
+    Pick two free cells that are far apart within the largest connected component.
+    Returns (start_gx, start_gy), (goal_gx, goal_gy), grid_distance, component_size.
+    """
+    h, w = free_mask.shape
+    visited = np.zeros_like(free_mask, dtype=bool)
+    neighbors = ((1, 0), (-1, 0), (0, 1), (0, -1))
+    largest_component = []
+
+    for y in range(h):
+        for x in range(w):
+            if not free_mask[y, x] or visited[y, x]:
+                continue
+            q = deque([(y, x)])
+            visited[y, x] = True
+            cells = []
+            while q:
+                cy, cx = q.popleft()
+                cells.append((cy, cx))
+                for dy, dx in neighbors:
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < h and 0 <= nx < w and free_mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = True
+                        q.append((ny, nx))
+            if len(cells) > len(largest_component):
+                largest_component = cells
+
+    if not largest_component:
+        raise ValueError("Occupancy grid has no free cells.")
+
+    def bfs_far(start_yx: Tuple[int, int]) -> Tuple[Tuple[int, int], int]:
+        sy, sx = start_yx
+        dist = np.full(free_mask.shape, -1, dtype=int)
+        dq = deque([(sy, sx)])
+        dist[sy, sx] = 0
+        far = (sy, sx, 0)
+        while dq:
+            cy, cx = dq.popleft()
+            d = dist[cy, cx]
+            if d > far[2]:
+                far = (cy, cx, d)
+            for dy, dx in neighbors:
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < h and 0 <= nx < w and free_mask[ny, nx] and dist[ny, nx] == -1:
+                    dist[ny, nx] = d + 1
+                    dq.append((ny, nx))
+        # return (gx, gy) order for consistency with world conversion
+        return (far[1], far[0]), far[2]
+
+    first = largest_component[0]
+    start_g, _ = bfs_far(first)
+    goal_g, max_steps = bfs_far((start_g[1], start_g[0]))
+    return start_g, goal_g, max_steps, len(largest_component)
+
+
+def load_real_env1_map(cfg) -> Tuple[GridMap, AckermannState, AckermannState, dict]:
+    """
+    Load the real_env1 occupancy grid + YAML, choose distant start/goal inside the
+    largest free component, and build a GridMap for planning.
+    """
+    grid_path = Path(cfg.get("grid_path", REAL_ENV1_GRID))
+    yaml_path = Path(cfg.get("yaml_path", REAL_ENV1_MAP_YAML))
+    if not grid_path.exists():
+        raise FileNotFoundError(f"real_env1 grid not found: {grid_path}")
+    occ = np.load(grid_path)
+    if occ.ndim != 2:
+        raise ValueError(f"Expected 2D occupancy grid at {grid_path}, got shape {occ.shape}")
+
+    if yaml_path.exists():
+        resolution, origin_xy = parse_ros_map_yaml(yaml_path)
+    else:
+        resolution = float(cfg.get("resolution", 0.1))
+        origin_xy = tuple(cfg.get("origin", (0.0, 0.0)))
+
+    grid_mask = (occ != 0).astype(np.uint8)  # treat unknown (-1) as obstacles
+    free_mask = occ == 0
+
+    start_g, goal_g, max_steps, comp_size = farthest_free_cells(free_mask)
+    start_x = start_g[0] * resolution + origin_xy[0]
+    start_y = start_g[1] * resolution + origin_xy[1]
+    goal_x = goal_g[0] * resolution + origin_xy[0]
+    goal_y = goal_g[1] * resolution + origin_xy[1]
+    heading = math.atan2(goal_y - start_y, goal_x - start_x)
+    start = AckermannState(start_x, start_y, heading)
+    goal = AckermannState(goal_x, goal_y, heading)
+
+    size = (grid_mask.shape[1] * resolution, grid_mask.shape[0] * resolution)
+    meta = dict(
+        resolution=resolution,
+        size=size,
+        free_cells=int(np.count_nonzero(free_mask)),
+        obstacle_cells=int(np.count_nonzero(grid_mask)),
+        component_size=comp_size,
+        max_grid_distance=max_steps,
+        origin=origin_xy,
+    )
+    grid_map = GridMap(grid_mask, resolution, origin_xy)
+    return grid_map, start, goal, meta
 
 
 def adaptive_goal_tolerances(
@@ -446,22 +634,36 @@ def normalize_variant(name: str) -> str:
 def build_variant(variant: str):
     variant_slug = normalize_variant(variant)
     cfg = FOREST_VARIANTS[variant_slug]
+    title = cfg.get("title", f"Forest ({variant_slug})")
+
+    if cfg.get("loader") == "real_env1":
+        grid_map, start, goal, meta = load_real_env1_map(cfg)
+        map_kwargs = {
+            "size": meta["size"],
+            "resolution": meta["resolution"],
+            "num_trees": meta.get("obstacle_cells", "obs_cells"),
+            "free_cells": meta.get("free_cells", None),
+            "obstacle_cells": meta.get("obstacle_cells", None),
+        }
+        return variant_slug, title, map_kwargs, start, goal, grid_map
+
     map_kwargs = dict(FOREST_MAP_KWARGS)
     map_kwargs.update(cfg.get("map_kwargs", {}))
 
     start, goal = compute_start_goal(map_kwargs)
     map_kwargs["keep_clear"] = [(start.x, start.y), (goal.x, goal.y)]
-    title = cfg.get("title", f"Forest ({variant_slug})")
-    return variant_slug, title, map_kwargs, start, goal
+    return variant_slug, title, map_kwargs, start, goal, None
 
 
 def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Path] = None, postprocess: str = "none"):
     output_dir = out_dir or (Path(__file__).resolve().parent / "outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     post_mode = (postprocess or "none").strip().lower()
-    variant_slug, title, map_kwargs, start, goal = build_variant(variant)
-    grid_map = make_forest_map(**map_kwargs)
-    size_x, size_y = map_kwargs["size"]
+    variant_slug, title, map_kwargs, start, goal, grid_map_override = build_variant(variant)
+    grid_map = grid_map_override or make_forest_map(**map_kwargs)
+    size_x, size_y = map_kwargs.get(
+        "size", (grid_map.data.shape[1] * grid_map.resolution, grid_map.data.shape[0] * grid_map.resolution)
+    )
     is_large_map = max(size_x, size_y) > 30.0
     params = AckermannParams()
     footprint = OrientedBoxFootprint(length=0.924, width=0.740)
@@ -473,9 +675,14 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
     )
 
     print(
-        f"Variant '{variant_slug}': size={map_kwargs['size']} m, "
-        f"trees={map_kwargs['num_trees']}, resolution={map_kwargs['resolution']:.2f} m"
+        f"Variant '{variant_slug}': size=({size_x:.2f}, {size_y:.2f}) m, "
+        f"trees/obstacles={map_kwargs.get('num_trees', 'n/a')}, resolution={map_kwargs.get('resolution', grid_map.resolution):.2f} m"
     )
+    if map_kwargs.get("free_cells") is not None:
+        print(
+            f"  Cells: free={map_kwargs['free_cells']:,}, "
+            f"obstacles/unknown={map_kwargs.get('obstacle_cells', 'n/a')}"
+        )
     if map_kwargs.get("wall_y") is not None:
         gap_center, gap_width = map_kwargs["wall_gap"]
         print(f"  Wall at y={map_kwargs['wall_y']:.2f} with gap center={gap_center:.2f}, width={gap_width:.2f}")
@@ -520,8 +727,8 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         stall_steps=80,
         theta_bins=64,
         min_step=0.05,
-        jitter_angle=1.0,
-        heading_rate=0.8,
+        jitter_angle=0.6,
+        heading_rate=0.65,
         coarse_collision=False,
     )
     # Variants can override RRT tuning; the sparse small-map-with-gap benefits from longer strides + looser heading.
@@ -550,8 +757,14 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
             )
         )
 
+    # Slightly loosen APF heading dynamics on the hardest scene to preserve success while smoothing later.
+    apf_kwargs_variant = dict(apf_kwargs)
+    if variant_slug == "large_map_small_gap":
+        apf_kwargs_variant.update(dict(jitter_angle=0.8, heading_rate=0.72))
+
+    post_checker = GridFootprintChecker(grid_map, footprint, theta_bins=72)
     planners = [
-        (APF_NAME, APFPlanner(grid_map, footprint, params, **apf_kwargs)),
+        (APF_NAME, APFPlanner(grid_map, footprint, params, **apf_kwargs_variant)),
         (HYBRID_NAME, HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **hybrid_kwargs)),
         (DQNHYBRID_NAME, DQNHybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **dqn_kwargs)),
         (RRT_NAME, RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
@@ -606,14 +819,30 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         stats["time_wall"] = time.time() - t0
         success = len(path) > 0
         expansions = stats.get("expansions", stats.get("expansions_total", stats.get("nodes", "-")))
-        path_len = path_length(path)
+        raw_path = list(path)
+        path_len = path_length(raw_path)
         plot_entries = []
         if success and post_mode in ("stomp", "feng"):
-            plot_entries.append((f"{label} (orig)", path, dict(stats)))
+            plot_entries.append((f"{label} (orig)", raw_path, dict(stats)))
             opt_t0 = time.time()
+            post_input_path = reorient_path_headings(raw_path)
+            if label == APF_NAME:
+                # Pre-smooth APF headings/positions to reduce zig-zags before optimization.
+                pre_smooth_path, ok_pre = laplacian_smooth_path(
+                    post_input_path,
+                    post_checker,
+                    ds_check=apf_collision_step,
+                    alpha=0.14,
+                    passes=3,
+                )
+                if ok_pre:
+                    post_input_path = pre_smooth_path
+            opt_path = []
+            opt_info = {}
+            suffix = post_mode
             if post_mode == "stomp":
                 opt_path, opt_info = stomp_optimize_path(
-                    path,
+                    post_input_path,
                     grid_map,
                     footprint,
                     params,
@@ -633,14 +862,14 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
                 )
                 suffix = "stomp"
                 if not opt_path:
-                    opt_path = path
+                    opt_path = post_input_path
                     opt_info = opt_info or {}
                     opt_info.setdefault("reason", "fallback_to_orig_path")
                     opt_info.setdefault("improved", False)
                     opt_info.setdefault("best_cost", opt_info.get("base_cost", float("inf")))
             else:
                 opt_path, opt_info = feng_optimize_path(
-                    path,
+                    post_input_path,
                     grid_map,
                     footprint,
                     params,
@@ -662,7 +891,7 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
                     seed=7,
                 )
                 suffix = "feng"
-                max_dev = max_xy_deviation(path, opt_path, samples=96) if opt_path else float("inf")
+                max_dev = max_xy_deviation(raw_path, opt_path, samples=96) if opt_path else float("inf")
                 no_change_tol = max(grid_map.resolution * 1.2, 0.08)
                 opt_info["max_deviation"] = max_dev
                 opt_info["no_change_tol"] = no_change_tol
@@ -672,12 +901,12 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
                 if (
                     not opt_path
                     or opt_info.get("reason") == "fallback_to_input"
-                    or paths_match(opt_path, path)
+                    or paths_match(opt_path, post_input_path)
                     or no_change
                 ):
                     stomp_fallback_info = {}
                     stomp_path, stomp_fallback_info = stomp_optimize_path(
-                        path,
+                        post_input_path,
                         grid_map,
                         footprint,
                         params,
@@ -709,19 +938,40 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
                         opt_info["reason"] = "feng_fallback_to_stomp"
                     else:
                         opt_info.setdefault("reason", "feng_no_change")
-            stats["postprocess"] = opt_info
-            stats["postprocess_time"] = time.time() - opt_t0
             if not opt_path:
-                opt_path = path
+                opt_path = post_input_path
                 opt_info = opt_info or {}
                 opt_info.setdefault("reason", "fallback_to_orig_path")
                 opt_info.setdefault("improved", False)
                 opt_info.setdefault("best_cost", opt_info.get("base_cost", float("inf")))
-                stats["postprocess"] = opt_info
-            opt_len = path_length(opt_path)
+            # Secondary smoothing when postprocessing could not change the geometry (APF often hugs obstacles).
+            post_max_dev = max_xy_deviation(raw_path, opt_path, samples=120) if opt_path else float("inf")
+            smooth_tol = max(grid_map.resolution * 0.8, 0.06)
+            if not opt_path or post_max_dev <= smooth_tol:
+                smooth_step = min(base_collision_step, apf_collision_step)
+                smooth_alpha = 0.22 if label == APF_NAME else 0.14
+                smoothed_path, smoothed = laplacian_smooth_path(
+                    opt_path or post_input_path,
+                    post_checker,
+                    ds_check=smooth_step,
+                    alpha=smooth_alpha,
+                    passes=5 if label == APF_NAME else 3,
+                )
+                if smoothed:
+                    smooth_dev = max_xy_deviation(raw_path, smoothed_path, samples=120)
+                    if smooth_dev > post_max_dev + 1e-6:
+                        opt_info.setdefault("fallback", {})["mode"] = "laplacian"
+                        opt_info["reason"] = opt_info.get("reason", "postprocess_no_change")
+                        opt_info["base_max_deviation"] = post_max_dev
+                        opt_info["max_deviation"] = smooth_dev
+                        opt_path = smoothed_path
+                        suffix = f"{suffix}+smooth"
+                        post_max_dev = smooth_dev
+            stats["postprocess"] = opt_info
+            stats["postprocess_time"] = time.time() - opt_t0
+            path_len = path_length(opt_path)
             plot_entries.append((f"{label} ({suffix})", opt_path, dict(stats)))
             path = opt_path
-            path_len = opt_len
         print(
             f"{label}: success={success}, time={stats.get('time',0):.2f}s, "
             f"path_len={path_len:.2f}, expansions/nodes={expansions}"
@@ -782,10 +1032,10 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         goal_x=goal.x,
         goal_y=goal.y,
         goal_theta=goal.theta,
-        resolution=map_kwargs["resolution"],
-        size_x=map_kwargs["size"][0],
-        size_y=map_kwargs["size"][1],
-        num_trees=map_kwargs["num_trees"],
+        resolution=map_kwargs.get("resolution", grid_map.resolution),
+        size_x=size_x,
+        size_y=size_y,
+        num_trees=map_kwargs.get("num_trees", ""),
         postprocess=post_mode if post_mode in ("stomp", "feng") else "none",
     )
 
@@ -797,7 +1047,7 @@ def parse_args():
     parser.add_argument(
         "--variant",
         default="large_map_small_gap",
-        help="Choose from: large_map_large_gap, large_map_small_gap, small_map_large_gap, small_map_small_gap, or 'all' to run every preset.",
+        help="Choose from: large_map_large_gap, large_map_small_gap, small_map_large_gap, small_map_small_gap, real_env1, or 'all' to run every preset.",
     )
     parser.add_argument(
         "--out-root",
