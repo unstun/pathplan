@@ -1,7 +1,7 @@
 import math
 import time
 from collections import deque
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -30,6 +30,8 @@ class APFPlanner:
         jitter_angle: float = 0.5,
         heading_rate: float = None,
         coarse_collision: bool = False,
+        escape_samples: int = 12,
+        escape_angle: float = 1.0,
     ):
         self.map = grid_map
         self.footprint = footprint
@@ -52,87 +54,224 @@ class APFPlanner:
         self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins) if not coarse_collision else None
         self.obstacle_dist_map = self._compute_obstacle_distance_map()
         self.goal_dist_map = None
+        self.escape_samples = max(4, int(escape_samples))
+        self.escape_angle = max(0.1, float(escape_angle))
+        offsets = np.linspace(-self.escape_angle, self.escape_angle, self.escape_samples)
+        self._escape_offsets = sorted(offsets.tolist(), key=lambda v: abs(v))
 
     def plan(
         self,
         start: AckermannState,
         goal: AckermannState,
         timeout: float = 3.0,
+        self_check: bool = True,
     ) -> Tuple[List[AckermannState], dict]:
         start_time = time.time()
-        if (self.coarse_collision and self.map.is_occupied(start.x, start.y)) or (
-            not self.coarse_collision and self.collision_checker.collides_pose(start.x, start.y, start.theta)
-        ):
-            return [], self._stats([], 0, time.time() - start_time, timed_out=False, reached=False)
+        remediations: List[str] = []
+        failure_reason = None
+        base_obstacle_gain = self.obstacle_gain
+        base_goal_gain = self.goal_gain
+        base_repulse_radius = self.repulse_radius
+        try:
+            if (self.coarse_collision and self.map.is_occupied(start.x, start.y)) or (
+                not self.coarse_collision and self.collision_checker.collides_pose(start.x, start.y, start.theta)
+            ):
+                return [], self._stats(
+                    [],
+                    0,
+                    time.time() - start_time,
+                    timed_out=False,
+                    reached=False,
+                    failure_reason="start_in_collision",
+                    remediations=remediations,
+                )
 
-        self.goal_dist_map = self._compute_goal_distance_map(goal)
-        if self.goal_dist_map is None:
-            return [], self._stats([], 0, time.time() - start_time, timed_out=False, reached=False)
+            self.goal_dist_map = self._compute_goal_distance_map(goal)
+            if self.goal_dist_map is None:
+                return [], self._stats(
+                    [],
+                    0,
+                    time.time() - start_time,
+                    timed_out=False,
+                    reached=False,
+                    failure_reason="goal_unreachable",
+                    remediations=remediations,
+                )
 
-        path: List[AckermannState] = [start]
-        current = start
-        last_potential = self._potential(current.x, current.y, goal)
-        stall_counter = 0
-        expansions = 0
-        reached = False
-        timed_out = False
+            path: List[AckermannState] = [start]
+            current = start
+            last_potential = self._potential(current.x, current.y, goal)
+            stall_counter = 0
+            expansions = 0
+            reached = False
+            timed_out = False
+            recovery_attempts = 0
 
-        for _ in range(self.max_iters):
-            if (time.time() - start_time) > timeout:
-                timed_out = True
-                break
-
-            dist_goal = math.hypot(goal.x - current.x, goal.y - current.y)
-            if dist_goal <= self.goal_tol:
-                reached = True
-                if self._segment_free(current, goal):
-                    path.append(goal)
-                break
-
-            grad_x, grad_y = self._gradient(current.x, current.y, goal)
-            if not math.isfinite(grad_x) or not math.isfinite(grad_y):
-                break
-            grad_norm = math.hypot(grad_x, grad_y)
-            if grad_norm < 1e-6:
-                break
-
-            desired_heading = math.atan2(-grad_y, -grad_x)
-            if stall_counter >= self.stall_steps:
-                desired_heading = wrap_angle(desired_heading + self._jitter_sign * self.jitter_angle)
-                self._jitter_sign *= -1.0
-                stall_counter = 0
-                step_scale = 0.5
-            else:
-                step_scale = 1.0
-            heading_error = heading_diff(desired_heading, current.theta)
-            max_heading_change = max(self.heading_rate, 1e-3)
-            delta_theta = clamp(heading_error, -max_heading_change, max_heading_change)
-            new_theta = wrap_angle(current.theta + delta_theta)
-
-            step = min(self.step_size * step_scale, dist_goal)
-            new_state = self._advance(current, new_theta, step)
-            if new_state is None:
-                break
-
-            new_potential = self._potential(new_state.x, new_state.y, goal)
-            if not math.isfinite(new_potential):
-                break
-            if new_potential >= last_potential - 1e-4:
-                stall_counter += 1
-                if stall_counter >= self.stall_steps:
+            for _ in range(self.max_iters):
+                if (time.time() - start_time) > timeout:
+                    timed_out = True
+                    failure_reason = "timeout"
                     break
-            else:
-                stall_counter = 0
 
-            path.append(new_state)
-            current = new_state
-            last_potential = new_potential
-            expansions += 1
+                dist_goal = math.hypot(goal.x - current.x, goal.y - current.y)
+                if dist_goal <= self.goal_tol:
+                    reached = True
+                    if self._segment_free(current, goal):
+                        path.append(goal)
+                    break
 
-        if not reached:
-            path = []
+                grad_x, grad_y = self._gradient(current.x, current.y, goal)
+                if not math.isfinite(grad_x) or not math.isfinite(grad_y):
+                    escape_state = self._attempt_escape(
+                        current,
+                        goal,
+                        current.theta,
+                        min(self.step_size, dist_goal),
+                        last_potential,
+                    )
+                    if self_check and escape_state is not None:
+                        path.append(escape_state)
+                        current = escape_state
+                        expansions += 1
+                        stall_counter = 0
+                        last_potential = self._potential(escape_state.x, escape_state.y, goal)
+                        remediations.append("escape_step")
+                        continue
+                    failure_reason = "gradient_invalid"
+                    break
+                grad_norm = math.hypot(grad_x, grad_y)
+                if grad_norm < 1e-6:
+                    escape_state = self._attempt_escape(
+                        current,
+                        goal,
+                        current.theta,
+                        min(self.step_size, dist_goal),
+                        last_potential,
+                    )
+                    if self_check and escape_state is not None:
+                        path.append(escape_state)
+                        current = escape_state
+                        expansions += 1
+                        stall_counter = 0
+                        last_potential = self._potential(escape_state.x, escape_state.y, goal)
+                        remediations.append("escape_step")
+                        continue
+                    failure_reason = "flat_gradient"
+                    break
 
-        return path, self._stats(path, expansions, time.time() - start_time, timed_out=timed_out, reached=reached)
+                desired_heading = math.atan2(-grad_y, -grad_x)
+                if stall_counter >= self.stall_steps:
+                    desired_heading = wrap_angle(desired_heading + self._jitter_sign * self.jitter_angle)
+                    self._jitter_sign *= -1.0
+                    stall_counter = 0
+                    step_scale = 0.5
+                else:
+                    step_scale = 1.0
+                heading_error = heading_diff(desired_heading, current.theta)
+                max_heading_change = max(self.heading_rate, 1e-3)
+                delta_theta = clamp(heading_error, -max_heading_change, max_heading_change)
+                new_theta = wrap_angle(current.theta + delta_theta)
+
+                step = min(self.step_size * step_scale, dist_goal)
+                new_state = self._advance(current, new_theta, step)
+                if new_state is None:
+                    escape_state = self._attempt_escape(
+                        current,
+                        goal,
+                        desired_heading,
+                        step,
+                        last_potential,
+                    )
+                    if self_check and escape_state is not None:
+                        path.append(escape_state)
+                        current = escape_state
+                        expansions += 1
+                        stall_counter = 0
+                        last_potential = self._potential(escape_state.x, escape_state.y, goal)
+                        remediations.append("escape_step")
+                        continue
+                    failure_reason = "collision_blocked"
+                    break
+
+                new_potential = self._potential(new_state.x, new_state.y, goal)
+                if not math.isfinite(new_potential):
+                    failure_reason = "invalid_potential"
+                    break
+                if new_potential >= last_potential - 1e-4:
+                    stall_counter += 1
+                    if stall_counter >= self.stall_steps:
+                        escape_state = self._attempt_escape(
+                            current,
+                            goal,
+                            desired_heading,
+                            step,
+                            last_potential,
+                        )
+                        if self_check and escape_state is not None:
+                            path.append(escape_state)
+                            current = escape_state
+                            expansions += 1
+                            stall_counter = 0
+                            last_potential = self._potential(escape_state.x, escape_state.y, goal)
+                            remediations.append("escape_step")
+                            continue
+                        if self_check and recovery_attempts < 2:
+                            recovery_attempts += 1
+                            self.obstacle_gain *= 0.85
+                            self.goal_gain *= 1.08
+                            self.repulse_radius *= 0.9
+                            remediations.append("relax_repulsion")
+                            stall_counter = 0
+                            continue
+                        failure_reason = "local_minima"
+                        break
+                else:
+                    stall_counter = 0
+
+                path.append(new_state)
+                current = new_state
+                last_potential = new_potential
+                expansions += 1
+
+            if not reached:
+                path = []
+                if failure_reason is None and not timed_out:
+                    failure_reason = "search_failed"
+
+            return path, self._stats(
+                path,
+                expansions,
+                time.time() - start_time,
+                timed_out=timed_out,
+                reached=reached,
+                failure_reason=failure_reason,
+                remediations=remediations,
+            )
+        finally:
+            self.obstacle_gain = base_obstacle_gain
+            self.goal_gain = base_goal_gain
+            self.repulse_radius = base_repulse_radius
+
+    def _attempt_escape(
+        self,
+        current: AckermannState,
+        goal: AckermannState,
+        heading: float,
+        step: float,
+        last_potential: float,
+    ) -> Optional[AckermannState]:
+        best = None
+        best_potential = last_potential
+        for offset in self._escape_offsets:
+            theta = wrap_angle(heading + offset)
+            candidate = self._advance(current, theta, step)
+            if candidate is None:
+                continue
+            candidate_potential = self._potential(candidate.x, candidate.y, goal)
+            if candidate_potential < best_potential - 1e-4:
+                best_potential = candidate_potential
+                best = candidate
+        return best
 
     def _advance(self, state: AckermannState, theta: float, step: float) -> AckermannState:
         """Move a small step while obeying curvature and checking collision."""
@@ -318,16 +457,23 @@ class APFPlanner:
         elapsed: float,
         timed_out: bool,
         reached: bool,
+        failure_reason: str = None,
+        remediations: List[str] = None,
     ) -> dict:
         length = 0.0
         for i in range(1, len(path)):
             dx = path[i].x - path[i - 1].x
             dy = path[i].y - path[i - 1].y
             length += math.hypot(dx, dy)
-        return {
+        stats = {
             "path_length": length,
             "expansions": expansions,
             "time": elapsed,
             "timed_out": timed_out,
             "success": reached and bool(path),
         }
+        if failure_reason:
+            stats["failure_reason"] = failure_reason
+        if remediations:
+            stats["remediations"] = remediations
+        return stats

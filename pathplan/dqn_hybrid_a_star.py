@@ -95,8 +95,21 @@ class DQNHybridAStarPlanner:
         goal: AckermannState,
         timeout: float = 5.0,
         max_nodes: int = 25000,
+        self_check: bool = True,
     ) -> Tuple[List[AckermannState], Dict[str, float]]:
         start_time = time.time()
+        remediations: List[str] = []
+        failure_reason = None
+        base_dqn_weight = self.dqn_weight
+        base_dqn_top_k = self.dqn_top_k
+        node_budget = max_nodes
+        max_node_budget = max(max_nodes, int(max_nodes * 1.5))
+        stall_limit = max(100, int(max_nodes * 0.05))
+        last_improve_expansion = 0
+        reduced_dqn_weight = False
+        expanded_dqn_top_k = False
+        extra_budget_used = False
+        force_anchor_until = -1
         anchor_heap: List[Tuple[float, int, Node]] = []
         dqn_heap: List[Tuple[float, int, Node]] = []
 
@@ -122,115 +135,198 @@ class DQNHybridAStarPlanner:
         expansions_dqn = 0
         counter = 1
         dqn_streak = 0
-
-        while (anchor_heap or dqn_heap) and (time.time() - start_time) < timeout and (
-            expansions_anchor + expansions_dqn
-        ) < max_nodes:
-            # Prefer DQN only when its best candidate is better; cap consecutive DQN pops to avoid anchor starvation.
-            use_anchor = True
-            if anchor_heap and dqn_heap:
-                anchor_key = anchor_heap[0][0]
-                dqn_key = dqn_heap[0][0]
-                dqn_leads = dqn_key <= anchor_key * self.dqn_lead_threshold
-                if dqn_leads and dqn_streak < self.max_dqn_streak:
-                    use_anchor = False
-            elif not anchor_heap and dqn_heap:
-                use_anchor = False
-            elif not dqn_heap and anchor_heap:
-                use_anchor = True
-
-            heap = anchor_heap if use_anchor else dqn_heap
-            _, _, current = heapq.heappop(heap)
-            key = self._discretize(current.state)
-            if key in visited and visited[key] <= current.g:
-                continue
-            visited[key] = current.g
-            if current.dqn_features is None:
-                feats, front_occ, heading_err = self.dqn.evaluate(current.state.as_tuple(), goal.as_tuple(), self.map)
-                current.dqn_features = feats
-                current.dqn_front_occ = front_occ
-                current.dqn_heading_err = heading_err
-
-            if self._goal_reached(current.state, goal):
-                path, actions = self._reconstruct_with_actions(current)
-                trace_poses, trace_boxes = self._trace_path(path, actions)
-                # Explicitly append the goal pose so outputs/plots hit the destination.
-                if not (math.isclose(path[-1].x, goal.x) and math.isclose(path[-1].y, goal.y) and math.isclose(path[-1].theta, goal.theta)):
-                    path.append(goal)
-                return path, self._stats(
-                    path,
-                    expansions_anchor,
-                    expansions_dqn,
+        best_goal_dist = math.hypot(goal.x - start.x, goal.y - start.y)
+        best_anchor = h_a
+        try:
+            if self.collision_checker.collides_pose(start.x, start.y, start.theta):
+                return [], self._stats(
+                    [],
+                    0,
+                    0,
                     time.time() - start_time,
-                    trace_poses,
-                    trace_boxes,
+                    [],
+                    [],
                     timed_out=False,
+                    failure_reason="start_in_collision",
+                    remediations=remediations,
+                )
+            if self.collision_checker.collides_pose(goal.x, goal.y, goal.theta):
+                return [], self._stats(
+                    [],
+                    0,
+                    0,
+                    time.time() - start_time,
+                    [],
+                    [],
+                    timed_out=False,
+                    failure_reason="goal_in_collision",
+                    remediations=remediations,
                 )
 
-            if use_anchor:
-                expansions_anchor += 1
-                dqn_streak = 0
-                actions = list(self.primitives)
+            while (anchor_heap or dqn_heap) and (time.time() - start_time) < timeout and (
+                expansions_anchor + expansions_dqn
+            ) < node_budget:
+                expansions_total = expansions_anchor + expansions_dqn
+                # Prefer DQN only when its best candidate is better; cap consecutive DQN pops to avoid anchor starvation.
+                use_anchor = True
+                if anchor_heap and dqn_heap:
+                    anchor_key = anchor_heap[0][0]
+                    dqn_key = dqn_heap[0][0]
+                    dqn_leads = dqn_key <= anchor_key * self.dqn_lead_threshold
+                    if dqn_leads and dqn_streak < self.max_dqn_streak:
+                        use_anchor = False
+                elif not anchor_heap and dqn_heap:
+                    use_anchor = False
+                elif not dqn_heap and anchor_heap:
+                    use_anchor = True
+
+                if self_check and force_anchor_until > expansions_total and anchor_heap:
+                    use_anchor = True
+
+                heap = anchor_heap if use_anchor else dqn_heap
+                _, _, current = heapq.heappop(heap)
+                key = self._discretize(current.state)
+                if key in visited and visited[key] <= current.g:
+                    continue
+                visited[key] = current.g
+                if current.dqn_features is None:
+                    feats, front_occ, heading_err = self.dqn.evaluate(current.state.as_tuple(), goal.as_tuple(), self.map)
+                    current.dqn_features = feats
+                    current.dqn_front_occ = front_occ
+                    current.dqn_heading_err = heading_err
+
+                goal_dist = math.hypot(goal.x - current.state.x, goal.y - current.state.y)
+                if goal_dist < best_goal_dist - 1e-3 or current.h_anchor < best_anchor - 1e-3:
+                    best_goal_dist = min(best_goal_dist, goal_dist)
+                    best_anchor = min(best_anchor, current.h_anchor)
+                    last_improve_expansion = expansions_total
+                if self_check and expansions_total - last_improve_expansion >= stall_limit:
+                    if not reduced_dqn_weight and self.dqn_weight > 0.5:
+                        self.dqn_weight = max(0.5, self.dqn_weight * 0.7)
+                        dqn_heap = [(node.f_dqn(self.dqn_weight), idx, node) for _, idx, node in dqn_heap]
+                        heapq.heapify(dqn_heap)
+                        remediations.append("downweight_dqn")
+                        reduced_dqn_weight = True
+                        last_improve_expansion = expansions_total
+                    if not expanded_dqn_top_k and self.dqn_top_k is not None and self.dqn_top_k < len(self.primitives):
+                        self.dqn_top_k = min(len(self.primitives), self.dqn_top_k + 2)
+                        remediations.append("expand_dqn_top_k")
+                        expanded_dqn_top_k = True
+                        last_improve_expansion = expansions_total
+                    if force_anchor_until <= expansions_total:
+                        force_anchor_until = expansions_total + stall_limit
+                        remediations.append("force_anchor_cooldown")
+
+                if self._goal_reached(current.state, goal):
+                    path, actions = self._reconstruct_with_actions(current)
+                    trace_poses, trace_boxes = self._trace_path(path, actions)
+                    # Explicitly append the goal pose so outputs/plots hit the destination.
+                    if not (math.isclose(path[-1].x, goal.x) and math.isclose(path[-1].y, goal.y) and math.isclose(path[-1].theta, goal.theta)):
+                        path.append(goal)
+                    return path, self._stats(
+                        path,
+                        expansions_anchor,
+                        expansions_dqn,
+                        time.time() - start_time,
+                        trace_poses,
+                        trace_boxes,
+                        timed_out=False,
+                        failure_reason=None,
+                        remediations=remediations,
+                    )
+
+                if use_anchor:
+                    expansions_anchor += 1
+                    dqn_streak = 0
+                    actions = list(self.primitives)
+                else:
+                    expansions_dqn += 1
+                    dqn_streak += 1
+                    scores = self.dqn.policy_from_eval(
+                        current.dqn_features,
+                        current.dqn_heading_err,
+                        current.dqn_front_occ,
+                        self.primitives,
+                    )
+                    idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+                    k = self.dqn_top_k if self.dqn_top_k is not None else len(idx)
+                    chosen = idx[:k]
+                    actions = [self.primitives[i] for i in chosen]
+
+                for prim in actions:
+                    arc_states, _ = sample_constant_steer_motion(
+                        current.state,
+                        prim.steering,
+                        prim.direction,
+                        prim.step,
+                        self.params,
+                        step=self.collision_step,
+                        footprint=None,
+                    )
+                    nxt = arc_states[-1]
+                    if self.collision_checker.collides_path(arc_states):
+                        continue
+                    g_new = current.g + primitive_cost(prim)
+                    if current.action and prim.direction != current.action.direction:
+                        g_new += 0.2
+                    new_key = self._discretize(nxt)
+                    if new_key in visited and visited[new_key] <= g_new:
+                        continue
+                    h_a_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
+                    dqn_feats, dqn_front_occ, dqn_heading_err = self.dqn.evaluate(nxt.as_tuple(), goal.as_tuple(), self.map)
+                    h_dqn_new = self.dqn.value_from_features(dqn_feats)
+                    node = Node(
+                        nxt,
+                        g=g_new,
+                        h_anchor=h_a_new,
+                        h_dqn=h_dqn_new,
+                        parent=current,
+                        action=prim,
+                        dqn_features=dqn_feats,
+                        dqn_heading_err=dqn_heading_err,
+                        dqn_front_occ=dqn_front_occ,
+                    )
+                    heapq.heappush(anchor_heap, (self._anchor_priority(node), counter, node))
+                    heapq.heappush(dqn_heap, (node.f_dqn(self.dqn_weight), counter, node))
+                    counter += 1
+
+                if self_check and not extra_budget_used:
+                    expansions_total = expansions_anchor + expansions_dqn
+                    if expansions_total >= node_budget - 1:
+                        elapsed = time.time() - start_time
+                        if elapsed < timeout * 0.9 and expansions_total - last_improve_expansion < stall_limit:
+                            new_budget = min(max_node_budget, int(node_budget * 1.25))
+                            if new_budget > node_budget:
+                                node_budget = new_budget
+                                extra_budget_used = True
+                                remediations.append("expanded_node_budget")
+
+            elapsed = time.time() - start_time
+            expansions_total = expansions_anchor + expansions_dqn
+            timed_out = elapsed >= timeout
+            budget_exhausted = expansions_total >= node_budget
+            if not anchor_heap and not dqn_heap:
+                failure_reason = "open_set_exhausted"
+            elif timed_out:
+                failure_reason = "timeout"
+            elif budget_exhausted:
+                failure_reason = "node_budget_exhausted"
             else:
-                expansions_dqn += 1
-                dqn_streak += 1
-                scores = self.dqn.policy_from_eval(
-                    current.dqn_features,
-                    current.dqn_heading_err,
-                    current.dqn_front_occ,
-                    self.primitives,
-                )
-                idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
-                k = self.dqn_top_k if self.dqn_top_k is not None else len(idx)
-                chosen = idx[:k]
-                actions = [self.primitives[i] for i in chosen]
-
-            for prim in actions:
-                arc_states, _ = sample_constant_steer_motion(
-                    current.state,
-                    prim.steering,
-                    prim.direction,
-                    prim.step,
-                    self.params,
-                    step=self.collision_step,
-                    footprint=None,
-                )
-                nxt = arc_states[-1]
-                if self.collision_checker.collides_path(arc_states):
-                    continue
-                g_new = current.g + primitive_cost(prim)
-                if current.action and prim.direction != current.action.direction:
-                    g_new += 0.2
-                new_key = self._discretize(nxt)
-                if new_key in visited and visited[new_key] <= g_new:
-                    continue
-                h_a_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
-                dqn_feats, dqn_front_occ, dqn_heading_err = self.dqn.evaluate(nxt.as_tuple(), goal.as_tuple(), self.map)
-                h_dqn_new = self.dqn.value_from_features(dqn_feats)
-                node = Node(
-                    nxt,
-                    g=g_new,
-                    h_anchor=h_a_new,
-                    h_dqn=h_dqn_new,
-                    parent=current,
-                    action=prim,
-                    dqn_features=dqn_feats,
-                    dqn_heading_err=dqn_heading_err,
-                    dqn_front_occ=dqn_front_occ,
-                )
-                heapq.heappush(anchor_heap, (self._anchor_priority(node), counter, node))
-                heapq.heappush(dqn_heap, (node.f_dqn(self.dqn_weight), counter, node))
-                counter += 1
-
-        return [], self._stats(
-            [],
-            expansions_anchor,
-            expansions_dqn,
-            time.time() - start_time,
-            [],
-            [],
-            timed_out=True,
-        )
+                failure_reason = "search_failed"
+            return [], self._stats(
+                [],
+                expansions_anchor,
+                expansions_dqn,
+                elapsed,
+                [],
+                [],
+                timed_out=timed_out,
+                failure_reason=failure_reason,
+                remediations=remediations,
+            )
+        finally:
+            self.dqn_weight = base_dqn_weight
+            self.dqn_top_k = base_dqn_top_k
 
     def _reconstruct_with_actions(self, node: Node) -> Tuple[List[AckermannState], List[Optional[MotionPrimitive]]]:
         path: List[AckermannState] = []
@@ -280,6 +376,8 @@ class DQNHybridAStarPlanner:
         trace_poses: List[Tuple[float, float, float]],
         trace_boxes: List[List[Tuple[float, float]]],
         timed_out: bool,
+        failure_reason: str = None,
+        remediations: List[str] = None,
     ):
         length = 0.0
         for i in range(1, len(path)):
@@ -294,6 +392,10 @@ class DQNHybridAStarPlanner:
             "time": elapsed,
             "timed_out": timed_out,
         }
+        if failure_reason:
+            stats["failure_reason"] = failure_reason
+        if remediations:
+            stats["remediations"] = remediations
         if trace_poses:
             stats["trace_poses"] = trace_poses
         if trace_boxes:

@@ -16,6 +16,8 @@ from pathplan import (
     APFPlanner,
 )
 
+from examples.planner_labels import APF_NAME, DQNHYBRID_NAME, HYBRID_NAME, RRT_NAME
+
 try:
     import matplotlib.pyplot as plt
 except ImportError:  # matplotlib is optional
@@ -115,10 +117,10 @@ def run_scenario(
 
     print(f"\n=== Scenario: {name} ===")
     planners = [
-        ("Artificial Potential Field", APFPlanner(grid_map, footprint, params)),
-        ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params)),
-        ("DQN Hybrid A*", DQNHybridAStarPlanner(grid_map, footprint, params)),
-        ("RRT*", RRTStarPlanner(grid_map, footprint, params)),
+        (APF_NAME, APFPlanner(grid_map, footprint, params)),
+        (HYBRID_NAME, HybridAStarPlanner(grid_map, footprint, params)),
+        (DQNHYBRID_NAME, DQNHybridAStarPlanner(grid_map, footprint, params)),
+        (RRT_NAME, RRTStarPlanner(grid_map, footprint, params)),
     ]
 
     found_paths = {}
@@ -136,6 +138,11 @@ def run_scenario(
             f"{label}: success={success}, time={stats.get('time',0):.2f}s, "
             f"path_len={length:.2f}, expansions={expansions}"
         )
+        failure_reason = stats.get("failure_reason", "")
+        remediations = stats.get("remediations", [])
+        if not success and failure_reason:
+            remediation_str = ";".join(remediations) if remediations else "none"
+            print(f"  failure_reason={failure_reason}, remediations={remediation_str}")
         results.append(
             {
                 "scenario": name,
@@ -145,6 +152,8 @@ def run_scenario(
                 "expansions_or_nodes": expansions,
                 "time": stats.get("time", 0.0),
                 "time_wall": stats.get("time_wall", 0.0),
+                "failure_reason": failure_reason,
+                "remediations": ";".join(remediations) if remediations else "",
             }
         )
         if success:
@@ -172,7 +181,17 @@ def main():
     if results:
         output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / "results.csv"
-        fieldnames = ["scenario", "planner", "success", "path_length", "expansions_or_nodes", "time", "time_wall"]
+        fieldnames = [
+            "scenario",
+            "planner",
+            "success",
+            "path_length",
+            "expansions_or_nodes",
+            "time",
+            "time_wall",
+            "failure_reason",
+            "remediations",
+        ]
         with csv_path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()

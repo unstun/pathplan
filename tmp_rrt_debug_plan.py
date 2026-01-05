@@ -34,7 +34,7 @@ class DebugRRT(RRTStarPlanner):
         return best_goal_idx is not None
 
 from pathplan.robot import AckermannState
-variant_slug, title, map_kwargs, start, goal = build_variant('small_map')
+variant_slug, title, map_kwargs, start, goal = build_variant('small_map_small_gap')
 grid_map = make_forest_map(**map_kwargs)
 params = AckermannParams()
 footprint = OrientedBoxFootprint(length=0.924, width=0.740)

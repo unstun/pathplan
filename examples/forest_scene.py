@@ -1,7 +1,9 @@
 """
 Dense forest scenario with many tree obstacles (flat terrain, no slopes).
-Four presets are available: large map, small map, large gap, small gap.
-Run one command to generate all four maps and four planners (APF, Hybrid A*, DQN Hybrid A*, RRT*):
+Four presets are available: large map with large gap, large map with small gap,
+small map with large gap, small map with small gap.
+Run one command to generate all four maps and four planners
+(APF, Hybrid A*, D-Hybrid A*, Informed RRT*):
     python -m examples.forest_scene --variant all
 Outputs (plots + CSV) are written to time-stamped folders in examples/outputs/.
 """
@@ -11,6 +13,7 @@ import csv
 import os
 import math
 import time
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -29,9 +32,19 @@ from pathplan import (
     DQNHybridAStarPlanner,
     RRTStarPlanner,
     APFPlanner,
+    feng_optimize_path,
+    stomp_optimize_path,
 )
 from pathplan.common import default_collision_step
 from pathplan.primitives import default_primitives
+
+from examples.planner_labels import (
+    APF_NAME,
+    DQNHYBRID_NAME,
+    HYBRID_NAME,
+    PLANNER_COLOR_MAP,
+    RRT_NAME,
+)
 
 try:
     import matplotlib.pyplot as plt
@@ -55,46 +68,95 @@ FOREST_MAP_KWARGS = dict(
 )
 
 FOREST_VARIANTS = {
-    "large_map": {
-        "title": "Forest (large map)",
+    "large_map_large_gap": {
+        "title": "Forest (large map, large gap)",
+        "map_kwargs": {
+            "size": (64.0, 40.0),
+            "num_trees": 550,
+            "clearance": 2.3,
+        },
+    },
+    "large_map_small_gap": {
+        "title": "Forest (large map, small gap)",
         "map_kwargs": {
             "size": (64.0, 40.0),
             "num_trees": 750,
             "clearance": 1.8,
         },
     },
-    "small_map": {
-        "title": "Forest (small map)",
+    "small_map_large_gap": {
+        "title": "Forest (small map, large gap)",
+        "map_kwargs": {
+            "size": (24.0, 16.0),
+            "num_trees": 82,
+            "clearance": 2.3,
+        },
+    },
+    "small_map_small_gap": {
+        "title": "Forest (small map, small gap)",
         "map_kwargs": {
             "size": (24.0, 16.0),
             "num_trees": 180,
             "clearance": 1.5,
         },
     },
-    "large_gap": {
-        "title": "Forest (large gap)",
-        "map_kwargs": {
-            "num_trees": 240,
-            "clearance": 2.3,
-        },
-    },
-    "small_gap": {
-        "title": "Forest (small gap)",
-        "map_kwargs": {
-            "num_trees": 500,
-            "clearance": 1.3,
-        },
-    },
 }
 
-PATH_COLOR_MAP = {
-    "Artificial Potential Field": "#d81b60",  # bold red/magenta
-    "Hybrid A*": "#1f77b4",  # deep blue
-    "DQN Hybrid A*": "#2ca02c",  # strong green
-    "RRT*": "#ff7f0e",  # vivid orange
-}
 FALLBACK_COLORS = ["#6a3d9a", "#a6cee3", "#b2df8a"]  # purple plus high-contrast backups
 PRIMARY_LINEWIDTH = 3.6
+
+
+def strip_variant_suffix(label: str) -> str:
+    """
+    Remove variant suffixes like '(orig)' or '(stomp)' while keeping formal names
+    that may themselves contain parentheses (e.g., '(APF)').
+    """
+    if " (" in label and label.endswith(")"):
+        suffix = label[label.rfind("(") + 1 : -1].strip().lower()
+        if suffix in ("orig", "stomp", "feng"):
+            return label[: label.rfind(" (")].strip()
+    return label
+
+
+def path_length(path: List[AckermannState]) -> float:
+    length = 0.0
+    for i in range(1, len(path)):
+        dx = path[i].x - path[i - 1].x
+        dy = path[i].y - path[i - 1].y
+        length += math.hypot(dx, dy)
+    return length
+
+
+def max_xy_deviation(a: List[AckermannState], b: List[AckermannState], samples: int = 80) -> float:
+    """
+    Measure the maximum XY drift between two paths after resampling them
+    to the same parametric positions. Useful for detecting when an optimizer
+    effectively returned the input trajectory (even with different sampling).
+    """
+    if not a or not b:
+        return float("inf")
+    samples = max(2, int(samples))
+    taus = np.linspace(0.0, 1.0, samples)
+
+    def sample(path: List[AckermannState]) -> np.ndarray:
+        if len(path) == 1:
+            return np.tile([[path[0].x, path[0].y]], (samples, 1))
+        pts = np.zeros((samples, 2), dtype=float)
+        last_idx = len(path) - 1
+        for i, tau in enumerate(taus):
+            s = tau * last_idx
+            i0 = int(math.floor(s))
+            i1 = min(i0 + 1, last_idx)
+            t = s - i0
+            p0 = path[i0]
+            p1 = path[i1]
+            pts[i, 0] = p0.x + (p1.x - p0.x) * t
+            pts[i, 1] = p0.y + (p1.y - p0.y) * t
+        return pts
+
+    pts_a = sample(a)
+    pts_b = sample(b)
+    return float(np.linalg.norm(pts_a - pts_b, axis=1).max())
 
 
 def compute_start_goal(map_kwargs):
@@ -119,23 +181,27 @@ def compute_start_goal(map_kwargs):
     return start, goal
 
 
-def adaptive_goal_tolerances(grid_map: GridMap, footprint: OrientedBoxFootprint, collision_step: float) -> Tuple[float, float]:
+def adaptive_goal_tolerances(
+    grid_map: GridMap, is_large_map: bool, collision_step: float, xy_resolution: float
+) -> Tuple[float, float]:
     """
-    Fixed goal tolerances for the benchmarks.
+    Scale goal tolerances to the lattice fidelity so planners can actually
+    dock at the goal without wasting time in sub-meter jitter.
     """
-    goal_xy_tol = 0.1
-    goal_theta_tol = math.radians(5.0)
+    base_xy = max(0.18, collision_step * 1.5, xy_resolution * 0.4)
+    goal_xy_tol = max(base_xy, 0.28 if is_large_map else 0.22)
+    goal_theta_tol = math.radians(10.0 if is_large_map else 7.0)
     return goal_xy_tol, goal_theta_tol
 
 
 DEFAULT_START, DEFAULT_GOAL = compute_start_goal(FOREST_MAP_KWARGS)
 
 # Planner budgets tuned for sub-second runs.
-APF_TIMEOUT = 4.0
+APF_TIMEOUT = 5.0
 APF_MAX_ITERS = 12_000
-HYBRID_TIMEOUT = 1.5
+HYBRID_TIMEOUT = 5.0
 HYBRID_MAX_NODES = 8_000
-DQN_TIMEOUT = 1.0
+DQN_TIMEOUT = 5.0
 DQN_MAX_NODES = 8_000
 RRT_TIMEOUT = 5.0
 RRT_MAX_ITER = 30_000
@@ -308,12 +374,23 @@ def plot_with_boxes(
     ax.scatter(start.x, start.y, c="#008000", marker="*", s=1760, label="start", edgecolors="black", linewidths=0)
     ax.scatter(goal.x, goal.y, c="#c8102e", marker="*", s=1760, label="goal", edgecolors="black", linewidths=0)
 
-    color_cycle = list(PATH_COLOR_MAP.values()) + FALLBACK_COLORS
+    color_cycle = list(PLANNER_COLOR_MAP.values()) + FALLBACK_COLORS
     for idx, (label, path, stats) in enumerate(planner_results):
-        color = PATH_COLOR_MAP.get(label, color_cycle[idx % len(color_cycle)])
+        base_label = strip_variant_suffix(label)
+        color = PLANNER_COLOR_MAP.get(base_label, color_cycle[idx % len(color_cycle)])
+        linestyle = "--" if "orig" in label.lower() else "-"
+        linewidth = PRIMARY_LINEWIDTH * (0.85 if "orig" in label.lower() else 1.0)
         xs = [p.x for p in path]
         ys = [p.y for p in path]
-        ax.plot(xs, ys, linewidth=PRIMARY_LINEWIDTH, color=color, solid_capstyle="round", label=label)
+        ax.plot(
+            xs,
+            ys,
+            linewidth=linewidth,
+            color=color,
+            solid_capstyle="round",
+            label=label,
+            linestyle=linestyle,
+        )
         boxes = stats.get("trace_boxes", [])
         if not boxes and path:
             boxes = [footprint.corners(p.x, p.y, p.theta) for p in path]
@@ -354,6 +431,12 @@ def plot_with_boxes(
 
 def normalize_variant(name: str) -> str:
     slug = name.strip().lower().replace(" ", "_").replace("-", "_")
+    slug = slug.replace("_with_", "_")
+    legacy_aliases = {
+        "large_map": "large_map_small_gap",
+        "small_map": "small_map_small_gap",
+    }
+    slug = legacy_aliases.get(slug, slug)
     if slug not in FOREST_VARIANTS:
         options = ", ".join(sorted(FOREST_VARIANTS))
         raise ValueError(f"Unknown variant '{name}'. Choose from: {options}.")
@@ -372,18 +455,22 @@ def build_variant(variant: str):
     return variant_slug, title, map_kwargs, start, goal
 
 
-def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None):
+def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Path] = None, postprocess: str = "none"):
     output_dir = out_dir or (Path(__file__).resolve().parent / "outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
+    post_mode = (postprocess or "none").strip().lower()
     variant_slug, title, map_kwargs, start, goal = build_variant(variant)
     grid_map = make_forest_map(**map_kwargs)
     size_x, size_y = map_kwargs["size"]
     is_large_map = max(size_x, size_y) > 30.0
     params = AckermannParams()
     footprint = OrientedBoxFootprint(length=0.924, width=0.740)
-    base_collision_step = default_collision_step(grid_map.resolution, preferred=0.20, max_step=0.25)
-    apf_collision_step = default_collision_step(grid_map.resolution, preferred=0.12, max_step=0.20)
-    goal_xy_tol, goal_theta_tol = adaptive_goal_tolerances(grid_map, footprint, base_collision_step)
+    base_collision_step = default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25)
+    apf_collision_step = default_collision_step(grid_map.resolution, preferred=0.10, max_step=0.18)
+    lattice_xy_res = 0.60
+    goal_xy_tol, goal_theta_tol = adaptive_goal_tolerances(
+        grid_map, is_large_map, base_collision_step, lattice_xy_res
+    )
 
     print(
         f"Variant '{variant_slug}': size={map_kwargs['size']} m, "
@@ -397,33 +484,34 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
         f"(auto from resolution {grid_map.resolution:.2f} m)"
     )
 
-    short_primitives = default_primitives(params, step_length=1.0)
+    step_length = 0.8 if is_large_map else 0.7
+    short_primitives = default_primitives(params, step_length=step_length)
     base_kwargs = dict(
-        xy_resolution=0.60,
+        xy_resolution=lattice_xy_res,
         collision_step=base_collision_step,
         goal_xy_tol=goal_xy_tol,
         goal_theta_tol=goal_theta_tol,
         theta_bins=48,
     )
-    hybrid_kwargs = dict(base_kwargs, heuristic_weight=2.2)
-    dqn_kwargs = dict(base_kwargs, dqn_top_k=3, anchor_inflation=2.0, dqn_weight=1.3)
+    hybrid_kwargs = dict(base_kwargs, heuristic_weight=1.8)
+    dqn_kwargs = dict(base_kwargs, dqn_top_k=3, anchor_inflation=1.6, dqn_weight=1.1)
     rrt_kwargs = dict(
-        goal_sample_rate=0.80 if is_large_map else 0.70,  # stronger bias for large scenes
-        neighbor_radius=5.0 if is_large_map else 4.0,
-        step_time=1.20 if is_large_map else 0.90,  # longer rollout on large maps, shorter on small
+        goal_sample_rate=0.80 if is_large_map else 0.90,  # strong bias, but leave room for exploration
+        neighbor_radius=5.0 if is_large_map else 2.8,
+        step_time=1.20 if is_large_map else 0.50,  # small maps use tighter rollouts
         velocity=1.0,
-        goal_xy_tol=max(goal_xy_tol, 0.40 if is_large_map else 0.25),
-        goal_theta_tol=max(goal_theta_tol, math.radians(45.0 if is_large_map else 15.0)),
+        goal_xy_tol=max(goal_xy_tol, 0.40 if is_large_map else 0.30),
+        goal_theta_tol=max(goal_theta_tol, math.radians(45.0 if is_large_map else 25.0)),
         goal_check_freq=1,
-        seed_steps=0,
-        collision_step=default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25),
+        seed_steps=4,
+        collision_step=default_collision_step(grid_map.resolution, preferred=0.12 if is_large_map else 0.10, max_step=0.20),
         lazy_collision=False,
         rewire=False,
         theta_bins=48,
     )
     apf_kwargs = dict(
-        step_size=0.25,
-        goal_tol=max(goal_xy_tol, 0.2),
+        step_size=0.22,
+        goal_tol=max(goal_xy_tol, 0.25 if is_large_map else 0.18),
         repulse_radius=1.1,
         obstacle_gain=1.0,
         goal_gain=1.2,
@@ -436,15 +524,73 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
         heading_rate=0.8,
         coarse_collision=False,
     )
+    # Variants can override RRT tuning; the sparse small-map-with-gap benefits from longer strides + looser heading.
+    if not is_large_map and variant_slug == "small_map_large_gap":
+        rrt_kwargs.update(
+            dict(
+                goal_sample_rate=0.80,
+                neighbor_radius=3.5,
+                step_time=0.80,
+                goal_theta_tol=max(goal_theta_tol, math.radians(35.0)),
+                seed_steps=6,
+                collision_step=default_collision_step(grid_map.resolution, preferred=0.10, max_step=0.20),
+            )
+        )
+    if is_large_map and variant_slug == "large_map_small_gap":
+        rrt_kwargs.update(
+            dict(
+                goal_sample_rate=0.80,
+                neighbor_radius=5.0,
+                step_time=1.20,
+                velocity=1.0,
+                goal_xy_tol=max(goal_xy_tol, 0.40),
+                goal_theta_tol=max(goal_theta_tol, math.radians(45.0)),
+                seed_steps=2,
+                collision_step=default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25),
+            )
+        )
+
     planners = [
-        ("Artificial Potential Field", APFPlanner(grid_map, footprint, params, **apf_kwargs)),
-        ("Hybrid A*", HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **hybrid_kwargs)),
-        ("DQN Hybrid A*", DQNHybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **dqn_kwargs)),
-        ("RRT*", RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
+        (APF_NAME, APFPlanner(grid_map, footprint, params, **apf_kwargs)),
+        (HYBRID_NAME, HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **hybrid_kwargs)),
+        (DQNHYBRID_NAME, DQNHybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **dqn_kwargs)),
+        (RRT_NAME, RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
     ]
 
     records = []
     planner_results = []
+    path_export_rows = []
+
+    def paths_match(a: List[AckermannState], b: List[AckermannState], pos_tol: float = 1e-3, theta_tol: float = 1e-3) -> bool:
+        """Check if two paths are effectively identical."""
+        if len(a) != len(b):
+            return False
+        for pa, pb in zip(a, b):
+            if math.hypot(pa.x - pb.x, pa.y - pb.y) > pos_tol:
+                return False
+            dtheta = abs((pa.theta - pb.theta + math.pi) % (2 * math.pi) - math.pi)
+            if dtheta > theta_tol:
+                return False
+        return True
+
+    def add_path_rows(label: str, path_seq: List[AckermannState]):
+        if not path_seq:
+            return
+        base_label = strip_variant_suffix(label)
+        lower_label = label.lower()
+        kind = "stomp" if "stomp" in lower_label else ("orig" if "orig" in lower_label else "final")
+        for idx, pose in enumerate(path_seq):
+            path_export_rows.append(
+                {
+                    "variant": variant_slug,
+                    "planner": base_label,
+                    "path_kind": kind,
+                    "point_idx": idx,
+                    "x": pose.x,
+                    "y": pose.y,
+                    "theta": pose.theta,
+                }
+            )
     for label, planner in planners:
         t0 = time.time()
         if isinstance(planner, RRTStarPlanner):
@@ -460,15 +606,132 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
         stats["time_wall"] = time.time() - t0
         success = len(path) > 0
         expansions = stats.get("expansions", stats.get("expansions_total", stats.get("nodes", "-")))
-        path_len = 0.0
-        for i in range(1, len(path)):
-            dx = path[i].x - path[i - 1].x
-            dy = path[i].y - path[i - 1].y
-            path_len += math.hypot(dx, dy)
+        path_len = path_length(path)
+        plot_entries = []
+        if success and post_mode in ("stomp", "feng"):
+            plot_entries.append((f"{label} (orig)", path, dict(stats)))
+            opt_t0 = time.time()
+            if post_mode == "stomp":
+                opt_path, opt_info = stomp_optimize_path(
+                    path,
+                    grid_map,
+                    footprint,
+                    params,
+                    step_size=0.25,
+                    ds_check=base_collision_step,
+                    rollouts=96,
+                    iters=50,
+                    lambda_=0.6,
+                    w_clear=0.6,
+                    w_goal=2.5,
+                    w_prior=0.1,
+                    w_track=0.05,
+                    allow_reverse=True,
+                    seed=13,
+                    goal=goal,
+                    laplacian_strength=0.4,
+                )
+                suffix = "stomp"
+                if not opt_path:
+                    opt_path = path
+                    opt_info = opt_info or {}
+                    opt_info.setdefault("reason", "fallback_to_orig_path")
+                    opt_info.setdefault("improved", False)
+                    opt_info.setdefault("best_cost", opt_info.get("base_cost", float("inf")))
+            else:
+                opt_path, opt_info = feng_optimize_path(
+                    path,
+                    grid_map,
+                    footprint,
+                    params,
+                    goal=goal,
+                    degree=5,
+                    max_segments=10,
+                    samples_per_seg=14,
+                    rect_size=2.8,
+                    safety_margin=0.2,
+                    output_step=0.22,
+                    ds_check=base_collision_step,
+                    iters=55,
+                    lr=0.1,
+                    w_terrain=1.4,
+                    w_safety=28.0,
+                    w_dyn=5.0,
+                    w_cont=6.0,
+                    w_track=0.12,
+                    seed=7,
+                )
+                suffix = "feng"
+                max_dev = max_xy_deviation(path, opt_path, samples=96) if opt_path else float("inf")
+                no_change_tol = max(grid_map.resolution * 1.2, 0.08)
+                opt_info["max_deviation"] = max_dev
+                opt_info["no_change_tol"] = no_change_tol
+                no_change = math.isfinite(max_dev) and max_dev <= no_change_tol
+                # If Feng falls back to the original or returns an empty/unchanged path, force a STOMP pass
+                # to ensure we still output a smoothed trajectory.
+                if (
+                    not opt_path
+                    or opt_info.get("reason") == "fallback_to_input"
+                    or paths_match(opt_path, path)
+                    or no_change
+                ):
+                    stomp_fallback_info = {}
+                    stomp_path, stomp_fallback_info = stomp_optimize_path(
+                        path,
+                        grid_map,
+                        footprint,
+                        params,
+                        step_size=0.25,
+                        ds_check=base_collision_step,
+                        rollouts=64,
+                        iters=35,
+                        lambda_=0.7,
+                        w_clear=0.6,
+                        w_goal=2.5,
+                        w_prior=0.1,
+                        w_track=0.05,
+                        allow_reverse=True,
+                        seed=21,
+                        goal=goal,
+                        laplacian_strength=0.38,
+                    )
+                    opt_info["fallback"] = {
+                        "mode": "stomp",
+                        "reason": opt_info.get("reason", "feng_no_change"),
+                        "stomp_reason": stomp_fallback_info.get("reason"),
+                        "stomp_improved": stomp_fallback_info.get("improved"),
+                        "stomp_selected_cost": stomp_fallback_info.get("selected_cost", stomp_fallback_info.get("best_cost")),
+                        "stomp_max_deviation": max_dev,
+                    }
+                    if stomp_path:
+                        opt_path = stomp_path
+                        suffix = "feng+stomp"
+                        opt_info["reason"] = "feng_fallback_to_stomp"
+                    else:
+                        opt_info.setdefault("reason", "feng_no_change")
+            stats["postprocess"] = opt_info
+            stats["postprocess_time"] = time.time() - opt_t0
+            if not opt_path:
+                opt_path = path
+                opt_info = opt_info or {}
+                opt_info.setdefault("reason", "fallback_to_orig_path")
+                opt_info.setdefault("improved", False)
+                opt_info.setdefault("best_cost", opt_info.get("base_cost", float("inf")))
+                stats["postprocess"] = opt_info
+            opt_len = path_length(opt_path)
+            plot_entries.append((f"{label} ({suffix})", opt_path, dict(stats)))
+            path = opt_path
+            path_len = opt_len
         print(
             f"{label}: success={success}, time={stats.get('time',0):.2f}s, "
             f"path_len={path_len:.2f}, expansions/nodes={expansions}"
         )
+        failure_reason = stats.get("failure_reason", "")
+        remediations = stats.get("remediations", [])
+        post_info = stats.get("postprocess", {}) if isinstance(stats.get("postprocess"), dict) else {}
+        if not success and failure_reason:
+            remediation_str = ";".join(remediations) if remediations else "none"
+            print(f"  failure_reason={failure_reason}, remediations={remediation_str}")
         records.append(
             {
                 "variant": variant_slug,
@@ -478,10 +741,23 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
                 "expansions_or_nodes": expansions,
                 "time": stats.get("time", 0.0),
                 "time_wall": stats.get("time_wall", 0.0),
+                "failure_reason": failure_reason,
+                "remediations": ";".join(remediations) if remediations else "",
+                "postprocess_mode": post_mode if post_mode in ("stomp", "feng") else "none",
+                "postprocess_reason": post_info.get("reason", ""),
+                "postprocess_improved": post_info.get("improved", ""),
+                "postprocess_selected_cost": post_info.get("selected_cost", ""),
+                "postprocess_time": stats.get("postprocess_time", 0.0),
             }
         )
         if success:
-            planner_results.append((label, path, stats))
+            if plot_entries:
+                planner_results.extend(plot_entries)
+                for lbl, pth, _ in plot_entries:
+                    add_path_rows(lbl, pth)
+            else:
+                planner_results.append((label, path, stats))
+                add_path_rows(label, path)
 
     saved_plot = plot_with_boxes(
         title,
@@ -498,21 +774,42 @@ def plan_forest_scene(variant: str = "large_map", out_dir: Optional[Path] = None
         for rec in records:
             rec["plot_path"] = str(saved_plot)
 
-    return records, saved_plot
+    run_info = dict(
+        variant=variant_slug,
+        start_x=start.x,
+        start_y=start.y,
+        start_theta=start.theta,
+        goal_x=goal.x,
+        goal_y=goal.y,
+        goal_theta=goal.theta,
+        resolution=map_kwargs["resolution"],
+        size_x=map_kwargs["size"][0],
+        size_y=map_kwargs["size"][1],
+        num_trees=map_kwargs["num_trees"],
+        postprocess=post_mode if post_mode in ("stomp", "feng") else "none",
+    )
+
+    return records, saved_plot, run_info, path_export_rows
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Forest scene planner presets.")
     parser.add_argument(
         "--variant",
-        default="large_map",
-        help="Choose from: large_map, small_map, large_gap, small_gap, or 'all' to run every preset.",
+        default="large_map_small_gap",
+        help="Choose from: large_map_large_gap, large_map_small_gap, small_map_large_gap, small_map_small_gap, or 'all' to run every preset.",
     )
     parser.add_argument(
         "--out-root",
         type=Path,
         default=Path(__file__).resolve().parent / "outputs",
         help="Base folder for results. A time-stamped subfolder is created inside.",
+    )
+    parser.add_argument(
+        "--postprocess",
+        choices=["none", "stomp", "feng"],
+        default="none",
+        help="Apply a trajectory postprocessor after planning (default: none).",
     )
     return parser.parse_args()
 
@@ -525,15 +822,35 @@ if __name__ == "__main__":
     print(f"Writing results to: {out_dir}")
 
     all_records = []
+    all_run_info = []
+    all_path_rows = []
     variants = list(FOREST_VARIANTS) if args.variant.strip().lower() in ("all", "any") else [args.variant]
     for variant_name in variants:
         print("\n" + "=" * 60)
-        records, _ = plan_forest_scene(variant_name, out_dir=out_dir)
+        records, _, run_info, path_rows = plan_forest_scene(variant_name, out_dir=out_dir, postprocess=args.postprocess)
         all_records.extend(records)
+        all_run_info.append(run_info)
+        all_path_rows.extend(path_rows)
 
     if all_records:
         csv_path = out_dir / "results.csv"
-        fieldnames = ["variant", "planner", "success", "path_length", "expansions_or_nodes", "time", "time_wall", "plot_path"]
+        fieldnames = [
+            "variant",
+            "planner",
+            "success",
+            "path_length",
+            "expansions_or_nodes",
+            "time",
+            "time_wall",
+            "failure_reason",
+            "remediations",
+            "postprocess_mode",
+            "postprocess_reason",
+            "postprocess_improved",
+            "postprocess_selected_cost",
+            "postprocess_time",
+            "plot_path",
+        ]
         with csv_path.open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
@@ -542,3 +859,43 @@ if __name__ == "__main__":
         print(f"\nSaved summary: {csv_path}")
     else:
         print("\nNo results to save.")
+
+    def write_excel_summary(path, run_rows, path_rows):
+        try:
+            from openpyxl import Workbook
+        except ImportError:
+            print("openpyxl not installed; skipping Excel export. Install with 'pip install openpyxl'.", file=sys.stderr)
+            return
+        wb = Workbook()
+        meta = wb.active
+        meta.title = "runs"
+        meta_headers = [
+            "variant",
+            "start_x",
+            "start_y",
+            "start_theta",
+            "goal_x",
+            "goal_y",
+            "goal_theta",
+            "resolution",
+            "size_x",
+            "size_y",
+            "num_trees",
+            "postprocess",
+        ]
+        meta.append(meta_headers)
+        for row in run_rows:
+            meta.append([row[h] for h in meta_headers])
+
+        path_sheet = wb.create_sheet("paths")
+        path_headers = ["variant", "planner", "path_kind", "point_idx", "x", "y", "theta"]
+        path_sheet.append(path_headers)
+        for row in path_rows:
+            path_sheet.append([row[h] for h in path_headers])
+
+        wb.save(path)
+
+    if all_run_info:
+        excel_path = out_dir / "results.xlsx"
+        write_excel_summary(excel_path, all_run_info, all_path_rows)
+        print(f"Saved Excel paths: {excel_path}")

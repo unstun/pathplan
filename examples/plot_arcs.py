@@ -1,9 +1,9 @@
 """
-Quick-start visualization for curved Hybrid A* trajectories.
+Quick-start visualization for curved Hybrid A* lattice trajectories.
 
 What it does:
 - Builds a tiny empty map.
-- Runs Hybrid A* (and optionally DQN Hybrid A* if you flip a flag).
+- Runs Hybrid A* (and optionally the D-Hybrid A* / DQN-guided variant if you flip a flag).
 - Plots the arc samples and per-step vehicle rectangles using the stats
   fields exposed by the planners (`trace_poses`, `trace_boxes`).
 
@@ -28,6 +28,8 @@ from pathplan import (
     RRTStarPlanner,
     DQNHybridAStarPlanner,
 )
+
+from examples.planner_labels import formal_planner_name
 
 try:
     import matplotlib.pyplot as plt
@@ -54,7 +56,7 @@ def plan_once(planner_cls):
         path, stats = planner.plan(start, goal, max_iter=4000, timeout=10.0)
     else:
         path, stats = planner.plan(start, goal, timeout=10.0)
-    label = planner_cls.__name__
+    label = formal_planner_name(planner_cls)
     expansions = stats.get("expansions_total", stats.get("expansions", stats.get("nodes")))
     print(f"Planner: {label}, success={bool(path)}, expansions/nodes={expansions}")
     return grid_map, start, goal, footprint, path, stats, label

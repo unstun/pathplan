@@ -59,76 +59,126 @@ class RRTStarPlanner:
         goal: AckermannState,
         max_iter: int = 3000,
         timeout: float = 5.0,
+        self_check: bool = True,
     ):
         start_time = time.time()
-        tree: List[TreeNode] = [TreeNode(start, parent=-1, cost=0.0)]
-        best_goal_idx = None
-        iterations = 0
-
-        if self.seed_steps > 0:
-            maybe_goal = self._seed_toward_goal(tree, goal, self.seed_steps)
-            if maybe_goal is not None:
-                best_goal_idx = maybe_goal
-                path = self._reconstruct(tree, best_goal_idx)
-                return path, {
-                    "nodes": len(tree),
-                    "iterations": iterations,
+        remediations: List[str] = []
+        failure_reason = None
+        base_step_time = self.step_time
+        base_goal_sample_rate = self.goal_sample_rate
+        adapted = False
+        blocked_attempts = 0
+        try:
+            if self.collision_checker.collides_pose(start.x, start.y, start.theta):
+                return [], {
+                    "nodes": 1,
+                    "iterations": 0,
                     "time": time.time() - start_time,
-                    "success": True,
+                    "success": False,
+                    "failure_reason": "start_in_collision",
+                    "remediations": remediations,
+                }
+            if self.collision_checker.collides_pose(goal.x, goal.y, goal.theta):
+                return [], {
+                    "nodes": 1,
+                    "iterations": 0,
+                    "time": time.time() - start_time,
+                    "success": False,
+                    "failure_reason": "goal_in_collision",
+                    "remediations": remediations,
                 }
 
-        for it in range(max_iter):
-            if (time.time() - start_time) > timeout:
-                break
-            iterations = it + 1
-            sample_state = self._sample_state(goal)
-            nearest_idx = self._nearest(tree, sample_state)
-            new_state = self._steer(tree[nearest_idx].state, sample_state)
-            if self._blocked(tree[nearest_idx].state, new_state):
-                continue
-            new_cost = tree[nearest_idx].cost + self._segment_cost(tree[nearest_idx].state, new_state)
-            parent_idx = nearest_idx
+            tree: List[TreeNode] = [TreeNode(start, parent=-1, cost=0.0)]
+            best_goal_idx = None
+            iterations = 0
 
-            if self.rewire:
-                neighbors = self._neighbors(tree, new_state)
-                for n_idx in neighbors:
-                    cand_cost = tree[n_idx].cost + self._segment_cost(tree[n_idx].state, new_state)
-                    if cand_cost < new_cost and not self._blocked(tree[n_idx].state, new_state):
-                        new_cost = cand_cost
-                        parent_idx = n_idx
+            if self.seed_steps > 0:
+                maybe_goal = self._seed_toward_goal(tree, goal, self.seed_steps)
+                if maybe_goal is not None:
+                    best_goal_idx = maybe_goal
+                    path = self._reconstruct(tree, best_goal_idx)
+                    return path, {
+                        "nodes": len(tree),
+                        "iterations": iterations,
+                        "time": time.time() - start_time,
+                        "success": True,
+                        "remediations": remediations,
+                    }
 
-            tree.append(TreeNode(new_state, parent_idx, new_cost))
-            new_idx = len(tree) - 1
+            for it in range(max_iter):
+                if (time.time() - start_time) > timeout:
+                    break
+                iterations = it + 1
+                sample_state = self._sample_state(goal)
+                nearest_idx = self._nearest(tree, sample_state)
+                new_state = self._steer(tree[nearest_idx].state, sample_state)
+                if self._blocked(tree[nearest_idx].state, new_state):
+                    blocked_attempts += 1
+                    if self_check and not adapted and blocked_attempts >= 200:
+                        blocked_ratio = blocked_attempts / max(1, iterations)
+                        if blocked_ratio > 0.7:
+                            self.step_time = max(0.25, self.step_time * 0.7)
+                            self.goal_sample_rate = max(0.05, self.goal_sample_rate * 0.7)
+                            remediations.append("shrink_step_time")
+                            remediations.append("reduce_goal_bias")
+                            adapted = True
+                    continue
+                new_cost = tree[nearest_idx].cost + self._segment_cost(tree[nearest_idx].state, new_state)
+                parent_idx = nearest_idx
 
-            if self.rewire:
-                # rewire neighbors
-                for n_idx in neighbors:
-                    cand_cost = new_cost + self._segment_cost(new_state, tree[n_idx].state)
-                    if cand_cost + 1e-6 < tree[n_idx].cost and not self._blocked(new_state, tree[n_idx].state):
-                        tree[n_idx].parent = new_idx
-                        tree[n_idx].cost = cand_cost
+                if self.rewire:
+                    neighbors = self._neighbors(tree, new_state)
+                    for n_idx in neighbors:
+                        cand_cost = tree[n_idx].cost + self._segment_cost(tree[n_idx].state, new_state)
+                        if cand_cost < new_cost and not self._blocked(tree[n_idx].state, new_state):
+                            new_cost = cand_cost
+                            parent_idx = n_idx
 
-            if self._goal_reached(new_state, goal):
-                goal_cost = new_cost + self._segment_cost(new_state, goal)
-                tree.append(TreeNode(goal, parent=new_idx, cost=goal_cost))
-                best_goal_idx = len(tree) - 1
-                break
-            if it % self.goal_check_freq == 0:
-                greedy_idx = self._nearest(tree, goal)
-                greedy_state = tree[greedy_idx].state
-                if self._goal_reached(greedy_state, goal):
-                    goal_cost = tree[greedy_idx].cost + self._segment_cost(greedy_state, goal)
-                    tree.append(TreeNode(goal, parent=greedy_idx, cost=goal_cost))
+                tree.append(TreeNode(new_state, parent_idx, new_cost))
+                new_idx = len(tree) - 1
+
+                if self.rewire:
+                    # rewire neighbors
+                    for n_idx in neighbors:
+                        cand_cost = new_cost + self._segment_cost(new_state, tree[n_idx].state)
+                        if cand_cost + 1e-6 < tree[n_idx].cost and not self._blocked(new_state, tree[n_idx].state):
+                            tree[n_idx].parent = new_idx
+                            tree[n_idx].cost = cand_cost
+
+                if self._goal_reached(new_state, goal):
+                    goal_cost = new_cost + self._segment_cost(new_state, goal)
+                    tree.append(TreeNode(goal, parent=new_idx, cost=goal_cost))
                     best_goal_idx = len(tree) - 1
                     break
+                if it % self.goal_check_freq == 0:
+                    greedy_idx = self._nearest(tree, goal)
+                    greedy_state = tree[greedy_idx].state
+                    if self._goal_reached(greedy_state, goal):
+                        goal_cost = tree[greedy_idx].cost + self._segment_cost(greedy_state, goal)
+                        tree.append(TreeNode(goal, parent=greedy_idx, cost=goal_cost))
+                        best_goal_idx = len(tree) - 1
+                        break
 
-        path = self._reconstruct(tree, best_goal_idx) if best_goal_idx is not None else []
-        return path, {
-            "nodes": len(tree),
-            "iterations": iterations,
-            "time": time.time() - start_time,
-            "success": best_goal_idx is not None,
-        }
+            path = self._reconstruct(tree, best_goal_idx) if best_goal_idx is not None else []
+            if best_goal_idx is None:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    failure_reason = "timeout"
+                elif iterations >= max_iter:
+                    failure_reason = "iteration_budget_exhausted"
+                else:
+                    failure_reason = "search_failed"
+            return path, {
+                "nodes": len(tree),
+                "iterations": iterations,
+                "time": time.time() - start_time,
+                "success": best_goal_idx is not None,
+                "failure_reason": failure_reason,
+                "remediations": remediations,
+            }
+        finally:
+            self.step_time = base_step_time
+            self.goal_sample_rate = base_goal_sample_rate
 
     def _sample_state(self, goal: AckermannState) -> AckermannState:
         if self.rng.random() < self.goal_sample_rate:

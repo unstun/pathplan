@@ -1,2 +1,4 @@
 python -m examples.forest_scene
 python -m examples.forest_scene --variant all
+python -m examples.forest_scene --variant all --postprocess stomp
+python -m examples.forest_scene --variant all --postprocess feng

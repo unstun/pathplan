@@ -1,5 +1,0 @@
-variant,planner,success,path_length,expansions_or_nodes,time,time_wall,plot_path
-large_map,Artificial Potential Field,True,68.63536983479993,274,0.31980133056640625,0.319896936416626,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251231_101959\dense_forest_large_map.png
-large_map,Hybrid A*,False,0.0,1792,1.0003459453582764,1.0038955211639404,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251231_101959\dense_forest_large_map.png
-large_map,DQN Hybrid A*,True,67.90240055863428,212,0.17999815940856934,0.18038201332092285,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251231_101959\dense_forest_large_map.png
-large_map,RRT*,False,0.0,2022,4.001040697097778,4.001157522201538,E:\tongbu\BaiduSyncdisk\study\phdprojec\pathplan_1.4\examples\outputs\20251231_101959\dense_forest_large_map.png

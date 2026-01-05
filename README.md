@@ -1,6 +1,6 @@
 # Path Planning Scaffold
 
-Python scaffold for Ackermann planners (Hybrid A*, DQN-guided Hybrid A*, Artificial Potential Field, kinodynamic RRT*) with a shared robot model and grid-based collision checker. Everything is NumPy-first, ROS-free, and kept small so you can swap pieces without digging through a framework.
+Python scaffold for Ackermann planners (APF, Hybrid A*, D-Hybrid A* (DQN-guided Hybrid A*), Informed RRT* (kinodynamic)) with a shared robot model and grid-based collision checker. Everything is NumPy-first, ROS-free, and kept small so you can swap pieces without digging through a framework.
 
 ## What’s inside (code map)
 
@@ -20,9 +20,9 @@ Python scaffold for Ackermann planners (Hybrid A*, DQN-guided Hybrid A*, Artific
 ## Planners (defaults in constructors)
 
 - **Hybrid A\*** (`HybridAStarPlanner`): 10 primitives (`default_primitives`, step `0.3 m`, reverse weight `1.2`), cusp penalty `0.2`, heading bins `72`, `collision_step≈0.1 m` (clamped), goal tolerances `0.1 m / 5°`, heuristic = Reeds-Shepp-style lower bound. `xy_resolution` defaults to the map resolution unless overridden (forests use coarser `0.60 m`, 48 bins).
-- **DQN Hybrid A\*** (`DQNHybridAStarPlanner`): same lattice, dual queues (anchor + DQN). DQN branch uses lightweight hand-tuned `DQNGuidance` unless you swap in `TorchDQNGuidance`. Config: `dqn_top_k`, `dqn_weight`, `anchor_inflation`, `dqn_lead_threshold`, `max_dqn_streak`.
-- **RRT\*** (`RRTStarPlanner`): forward-simulate bicycle for `step_time=0.6 s` at `velocity=0.8 m/s`, goal bias `0.2`, neighbor radius `1.5 m`, goal tolerances `0.1 m / 5°`, optional rewiring, `collision_step` uses the shared default, `theta_bins=72`, `lazy_collision` switch for goal-only checks.
-- **Artificial Potential Field** (`APFPlanner`): attractive + repulsive potentials over a precomputed obstacle distance map, curvature-limited heading rate, `collision_step` uses the shared default. Can run coarse (point) collision via `coarse_collision=True` or use the footprint checker.
+- **D-Hybrid A\*** (`DQNHybridAStarPlanner`, DQN-guided Hybrid A*): same lattice, dual queues (anchor + DQN). DQN branch uses lightweight hand-tuned `DQNGuidance` unless you swap in `TorchDQNGuidance`. Config: `dqn_top_k`, `dqn_weight`, `anchor_inflation`, `dqn_lead_threshold`, `max_dqn_streak`.
+- **Informed RRT\*** (`RRTStarPlanner`, kinodynamic): forward-simulate bicycle for `step_time=0.6 s` at `velocity=0.8 m/s`, goal bias `0.2`, neighbor radius `1.5 m`, goal tolerances `0.1 m / 5°`, optional rewiring, `collision_step` uses the shared default, `theta_bins=72`, `lazy_collision` switch for goal-only checks.
+- **APF** (`APFPlanner`, Artificial Potential Field): attractive + repulsive potentials over a precomputed obstacle distance map, curvature-limited heading rate, `collision_step` uses the shared default. Can run coarse (point) collision via `coarse_collision=True` or use the footprint checker.
 
 ## Install & run
 
@@ -37,8 +37,18 @@ python -m examples.run_demo
 Forest benchmarks (writes `examples/outputs/<timestamp>/`):
 ```bash
 python -m examples.forest_scene --variant all
-# or: --variant large_map | small_map | large_gap | small_gap
+# or: --variant large_map_large_gap | large_map_small_gap | small_map_large_gap | small_map_small_gap
+# enable trajectory smoothing with the STOMP-style postprocessor:
+python -m examples.forest_scene --variant small_map_small_gap --postprocess stomp
+# or the constraint-aware Bezier optimizer:
+python -m examples.forest_scene --variant small_map_small_gap --postprocess feng
 ```
+
+## Trajectory postprocessing
+
+- STOMP-style smoother: `stomp_optimize_path(path, grid_map, footprint, params, goal=None, **kwargs)` in `pathplan.postprocess`. Works on any returned path (Hybrid A*, D-Hybrid A*, Informed RRT*, APF). Prefers returning the latest optimized curve even when the cost does not beat the baseline; only falls back when controls cannot be inferred or no collision-free rollout exists. Info reports both `best_cost` (lowest seen) and `selected_cost` (returned path). Uses existing primitives for simulation (`propagate`) and collision checking (`GridFootprintChecker`), plus a chamfer distance map for clearance penalties. Key knobs: `step_size`, `rollouts`, `iters`, `lambda_`, `w_smooth`, `w_steer`, `w_clear`, `allow_reverse`, `laplacian_strength`, `laplacian_passes`. Defaults are tuned for fast postprocessing (sub-second on demo maps).
+- Constraint-aware Bezier optimizer (Feng et al. 2025 inspired): `feng_optimize_path(...)` converts the path into multi-segment quintic Bezier curves, applies safety rectangles extracted from the grid, and minimizes jerk and terrain/clearance costs under continuity and dynamic limits. Use `samples_per_seg`, `iters`, `rect_size`, `w_safety`, `w_terrain`, `w_cont` to balance smoothness and safety; it falls back to the input path if constraints cannot be satisfied, and the forest CLI will auto-run a STOMP fallback when Feng returns an empty/unchanged path to keep an optimized trajectory in the results.
+- Enable end-to-end from the CLI with `--postprocess stomp` or `--postprocess feng` (forest_scene) or call directly in your own scripts; optimizers return `(optimized_path, info_dict)`.
 
 ## Torch DQN guidance (optional)
 
@@ -70,7 +80,7 @@ path, stats = planner.plan(start, goal, timeout=4.0)
 print("Success:", bool(path), "Expansions:", stats["expansions"], "Path length:", stats["path_length"])
 ```
 
-Swap in `DQNHybridAStarPlanner` for guided search or `RRTStarPlanner` for sampling-based planning.
+Swap in `DQNHybridAStarPlanner` for the D-Hybrid A* variant or `RRTStarPlanner` for Informed RRT* sampling.
 
 ## Extending / safety knobs
 
@@ -83,8 +93,9 @@ Swap in `DQNHybridAStarPlanner` for guided search or `RRTStarPlanner` for sampli
 ## Outputs and metrics
 
 - Hybrid A*: `expansions`, `time`, `timed_out`, `path_length`, optional `trace_poses`/`trace_boxes` for plotting.
-- DQN Hybrid A*: adds `expansions_anchor`, `expansions_dqn`, `expansions_total`.
-- RRT*: `nodes`, `iterations`, `time`, `success`, `path`.
+- D-Hybrid A*: adds `expansions_anchor`, `expansions_dqn`, `expansions_total`.
+- Informed RRT*: `nodes`, `iterations`, `time`, `success`, `path`.
 - APF: `time`, `reached`, `timed_out`, `path_length` (path empty on failure).
+- All planners may include `failure_reason` and `remediations` when self-checking is enabled.
 
 Quantitative CSVs and plots are written under `examples/outputs/` by the demos/benchmarks. Use these to benchmark, compare planners, or tune hyperparameters.

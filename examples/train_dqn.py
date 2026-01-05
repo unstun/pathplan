@@ -1,5 +1,5 @@
 """
-Minimal DQN training loop for the Hybrid A* guidance head.
+Minimal DQN training loop for the D-Hybrid A* (DQN-guided Hybrid A*) guidance head.
 Uses a lightweight CNN over local occupancy patches plus scalar goal features.
 CUDA is used automatically when available.
 """
@@ -280,7 +280,9 @@ def optimize_model(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train a DQN guidance model for Hybrid A* (uses CUDA when available).")
+    parser = argparse.ArgumentParser(
+        description="Train a DQN guidance model for the D-Hybrid A* (DQN-guided Hybrid A*) planner (uses CUDA when available)."
+    )
     parser.add_argument("--episodes", type=int, default=400, help="Number of training episodes.")
     parser.add_argument("--batch-size", type=int, default=64, help="Replay batch size.")
     parser.add_argument("--buffer-size", type=int, default=50000, help="Replay buffer capacity.")
