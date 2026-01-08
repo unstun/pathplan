@@ -29,7 +29,6 @@ class APFPlanner:
         min_step: float = None,
         jitter_angle: float = 0.5,
         heading_rate: float = None,
-        coarse_collision: bool = False,
         escape_samples: int = 12,
         escape_angle: float = 1.0,
     ):
@@ -50,14 +49,57 @@ class APFPlanner:
         self.jitter_angle = jitter_angle
         self._jitter_sign = 1.0
         self.heading_rate = heading_rate if heading_rate is not None else self.step_size / max(self.params.min_turn_radius, 1e-6)
-        self.coarse_collision = coarse_collision
-        self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins) if not coarse_collision else None
+        self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
+        # Keep the potential fields aligned with the inflated collision footprint by
+        # dilating obstacles before building distance maps.
+        padding_for_distance = max(self.collision_checker.padding, 0.0)
+        if padding_for_distance > 0.0:
+            self._distance_occ = grid_map.inflate(padding_for_distance).data
+        else:
+            self._distance_occ = np.asarray(grid_map.data)
         self.obstacle_dist_map = self._compute_obstacle_distance_map()
         self.goal_dist_map = None
         self.escape_samples = max(4, int(escape_samples))
         self.escape_angle = max(0.1, float(escape_angle))
         offsets = np.linspace(-self.escape_angle, self.escape_angle, self.escape_samples)
         self._escape_offsets = sorted(offsets.tolist(), key=lambda v: abs(v))
+
+    def _goal_map_step(self, state: AckermannState) -> Optional[AckermannState]:
+        """
+        Take a small step that strictly decreases the grid shortest-path distance
+        to the goal (ignores repulsion). This is a low-noise fallback when the
+        potential gradient is invalid/flat, commonly encountered near ragged
+        real-world map boundaries.
+        """
+        if self.goal_dist_map is None:
+            return None
+        gx = int(round((state.x - self.map.origin[0]) / self.map.resolution))
+        gy = int(round((state.y - self.map.origin[1]) / self.map.resolution))
+        h, w = self.goal_dist_map.shape
+        if gx < 0 or gx >= w or gy < 0 or gy >= h:
+            return None
+        current_d = self.goal_dist_map[gy, gx]
+        if not math.isfinite(current_d):
+            return None
+        best = None
+        best_d = current_d
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx = gx + dx
+            ny = gy + dy
+            if nx < 0 or nx >= w or ny < 0 or ny >= h:
+                continue
+            nd = self.goal_dist_map[ny, nx]
+            if not math.isfinite(nd):
+                continue
+            if nd + 1e-6 < best_d:
+                best = (nx, ny, nd)
+                best_d = nd
+        if best is None:
+            return None
+        tx, ty = self.map.grid_to_world(best[0], best[1])
+        heading = math.atan2(ty - state.y, tx - state.x)
+        step = min(self.step_size, math.hypot(tx - state.x, ty - state.y) * 1.05)
+        return self._advance(state, heading, step)
 
     def plan(
         self,
@@ -73,9 +115,7 @@ class APFPlanner:
         base_goal_gain = self.goal_gain
         base_repulse_radius = self.repulse_radius
         try:
-            if (self.coarse_collision and self.map.is_occupied(start.x, start.y)) or (
-                not self.coarse_collision and self.collision_checker.collides_pose(start.x, start.y, start.theta)
-            ):
+            if self.collision_checker.collides_pose(start.x, start.y, start.theta):
                 return [], self._stats(
                     [],
                     0,
@@ -122,6 +162,15 @@ class APFPlanner:
 
                 grad_x, grad_y = self._gradient(current.x, current.y, goal)
                 if not math.isfinite(grad_x) or not math.isfinite(grad_y):
+                    fallback = self._goal_map_step(current)
+                    if self_check and fallback is not None:
+                        path.append(fallback)
+                        current = fallback
+                        expansions += 1
+                        stall_counter = 0
+                        last_potential = self._potential(fallback.x, fallback.y, goal)
+                        remediations.append("goal_grid_step")
+                        continue
                     escape_state = self._attempt_escape(
                         current,
                         goal,
@@ -141,6 +190,15 @@ class APFPlanner:
                     break
                 grad_norm = math.hypot(grad_x, grad_y)
                 if grad_norm < 1e-6:
+                    fallback = self._goal_map_step(current)
+                    if self_check and fallback is not None:
+                        path.append(fallback)
+                        current = fallback
+                        expansions += 1
+                        stall_counter = 0
+                        last_potential = self._potential(fallback.x, fallback.y, goal)
+                        remediations.append("goal_grid_step")
+                        continue
                     escape_state = self._attempt_escape(
                         current,
                         goal,
@@ -199,6 +257,17 @@ class APFPlanner:
                     break
                 if new_potential >= last_potential - 1e-4:
                     stall_counter += 1
+                    fallback = None
+                    if self_check and stall_counter >= max(1, self.stall_steps // 2):
+                        fallback = self._goal_map_step(current)
+                    if self_check and fallback is not None:
+                        path.append(fallback)
+                        current = fallback
+                        expansions += 1
+                        stall_counter = 0
+                        last_potential = self._potential(fallback.x, fallback.y, goal)
+                        remediations.append("goal_grid_step")
+                        continue
                     if stall_counter >= self.stall_steps:
                         escape_state = self._attempt_escape(
                             current,
@@ -262,16 +331,25 @@ class APFPlanner:
     ) -> Optional[AckermannState]:
         best = None
         best_potential = last_potential
-        for offset in self._escape_offsets:
-            theta = wrap_angle(heading + offset)
-            candidate = self._advance(current, theta, step)
-            if candidate is None:
-                continue
-            candidate_potential = self._potential(candidate.x, candidate.y, goal)
-            if candidate_potential < best_potential - 1e-4:
-                best_potential = candidate_potential
-                best = candidate
-        return best
+        fallback = None
+        fallback_potential = float("inf")
+        base_headings = [heading]
+        if abs(wrap_angle(current.theta - heading)) > 1e-3:
+            base_headings.append(current.theta)
+        for base_heading in base_headings:
+            for offset in self._escape_offsets + [-math.pi, math.pi]:
+                theta = wrap_angle(base_heading + offset)
+                candidate = self._advance(current, theta, step)
+                if candidate is None:
+                    continue
+                candidate_potential = self._potential(candidate.x, candidate.y, goal)
+                if candidate_potential < best_potential - 1e-4:
+                    best_potential = candidate_potential
+                    best = candidate
+                if candidate_potential < fallback_potential:
+                    fallback_potential = candidate_potential
+                    fallback = candidate
+        return best if best is not None else fallback
 
     def _advance(self, state: AckermannState, theta: float, step: float) -> AckermannState:
         """Move a small step while obeying curvature and checking collision."""
@@ -288,16 +366,6 @@ class APFPlanner:
         return None
 
     def _segment_free(self, a: AckermannState, b: AckermannState) -> bool:
-        if self.coarse_collision:
-            steps = max(1, int(math.ceil(math.hypot(b.x - a.x, b.y - a.y) / max(self.collision_step, 1e-6))))
-            for i in range(steps + 1):
-                s = i / steps
-                x = a.x + (b.x - a.x) * s
-                y = a.y + (b.y - a.y) * s
-                if self.map.is_occupied(x, y):
-                    return False
-            return True
-        else:
             return not self.collision_checker.motion_collides(a.as_tuple(), b.as_tuple(), step=self.collision_step)
 
     def _gradient(self, x: float, y: float, goal: AckermannState) -> Tuple[float, float]:
@@ -323,9 +391,15 @@ class APFPlanner:
         if d_obs <= 1e-6:
             return float("inf")
 
+        repulse_gain = self.obstacle_gain
+        if d_goal < self.repulse_radius:
+            # Weaken repulsion close to the goal to avoid oscillations in tight clearances.
+            scale = clamp(d_goal / max(self.repulse_radius, 1e-6), 0.35, 1.0)
+            repulse_gain *= 0.5 + 0.5 * scale
+
         if d_obs < self.repulse_radius:
             inv = (1.0 / d_obs) - (1.0 / self.repulse_radius)
-            u_rep = 0.5 * self.obstacle_gain * inv * inv
+            u_rep = 0.5 * repulse_gain * inv * inv
         else:
             u_rep = 0.0
         return u_att + u_rep
@@ -374,7 +448,7 @@ class APFPlanner:
 
     def _compute_obstacle_distance_map(self) -> np.ndarray:
         """Approximate Euclidean distance-to-obstacle using a chamfer transform."""
-        occ = np.asarray(self.map.data, dtype=bool)
+        occ = np.asarray(self._distance_occ, dtype=bool)
         h, w = occ.shape
         dist = np.full((h, w), np.inf, dtype=float)
         dist[occ] = 0.0
@@ -423,7 +497,7 @@ class APFPlanner:
     def _compute_goal_distance_map(self, goal: AckermannState) -> np.ndarray:
         """Grid shortest-path distance from every free cell to the goal (4-neighborhood)."""
         h, w = self.map.data.shape
-        occ = np.asarray(self.map.data, dtype=bool)
+        occ = np.asarray(self._distance_occ, dtype=bool)
         gxi, gyi = self.map.world_to_grid(goal.x, goal.y)
         if gxi < 0 or gxi >= w or gyi < 0 or gyi >= h or occ[gyi, gxi]:
             return None

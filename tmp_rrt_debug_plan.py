@@ -20,8 +20,8 @@ class DebugRRT(RRTStarPlanner):
             iterations = it + 1
             sample_state = goal if self.rng.random() < self.goal_sample_rate else AckermannState(*self.map.random_free_state(self.rng))
             nearest_idx = self._nearest(tree, sample_state)
-            new_state = self._steer(tree[nearest_idx].state, sample_state)
-            if self._blocked(tree[nearest_idx].state, new_state):
+            new_state, rollout_path = self._steer(tree[nearest_idx].state, sample_state)
+            if self._trajectory_collides(rollout_path):
                 continue
             new_cost = tree[nearest_idx].cost + self._segment_cost(tree[nearest_idx].state, new_state)
             parent_idx = nearest_idx
@@ -48,8 +48,6 @@ r = DebugRRT(grid_map, footprint, params,
     goal_check_freq=1,
     seed_steps=40,
     collision_step=default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25),
-    lazy_collision=False,
     rewire=False,
-    theta_bins=48,
 )
 print('result', r.plan(start, goal, max_iter=30000, timeout=3.0))

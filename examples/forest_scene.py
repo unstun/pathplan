@@ -17,7 +17,7 @@ import sys
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Set, Tuple
 
 # Allow duplicated Intel OpenMP runtimes (NumPy + other libs) to coexist for this script.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -46,6 +46,7 @@ from examples.planner_labels import (
     HYBRID_NAME,
     PLANNER_COLOR_MAP,
     RRT_NAME,
+    formal_planner_name,
 )
 
 try:
@@ -112,10 +113,24 @@ FOREST_VARIANTS = {
         "loader": "real_env1",
         "grid_path": REAL_ENV1_GRID,
         "yaml_path": REAL_ENV1_MAP_YAML,
+        "preferred_start": (2.0, 7.0),
+        "preferred_goal": (-28.0, 1.5),
     },
 }
 
 FALLBACK_COLORS = ["#6a3d9a", "#a6cee3", "#b2df8a"]  # purple plus high-contrast backups
+AMBIGUOUS_LEGEND_NAMES = [
+    "Path I",
+    "Path l",
+    "Path 1",
+    "Path |",
+    "Path !",
+    "Plan I",
+    "Plan l",
+    "Plan 1",
+    "Plan |",
+    "Plan !",
+]
 PRIMARY_LINEWIDTH = 3.6
 
 
@@ -126,9 +141,60 @@ def strip_variant_suffix(label: str) -> str:
     """
     if " (" in label and label.endswith(")"):
         suffix = label[label.rfind("(") + 1 : -1].strip().lower()
-        if suffix in ("orig", "stomp", "feng"):
+        # Handle combined tags such as 'feng+stomp' by splitting on common separators.
+        for sep in ("+", "/", "|", "&"):
+            suffix = suffix.replace(sep, " ")
+        suffix_tokens = {tok.strip() for tok in suffix.split() if tok.strip()}
+        if suffix_tokens.intersection({"orig", "stomp", "feng"}):
             return label[: label.rfind(" (")].strip()
     return label
+
+
+def normalize_planner_label(label: str) -> str:
+    """
+    Map user-facing labels/aliases to the formal planner label.
+    Accepts shorthands like 'rrt' or 'hybrid'.
+    """
+    if not label:
+        return ""
+    text = str(label).strip()
+    if not text:
+        return ""
+    formal = formal_planner_name(text)
+    if formal and formal != text:
+        return formal
+    slug = text.lower().replace(" ", "")
+    aliases = {
+        "rrt": RRT_NAME,
+        "rrt*": RRT_NAME,
+        "informedrrt*": RRT_NAME,
+        "apf": APF_NAME,
+        "hybrid": HYBRID_NAME,
+        "hybrida*": HYBRID_NAME,
+        "dhybrid": DQNHYBRID_NAME,
+        "d-hybrid": DQNHYBRID_NAME,
+        "dhybrida*": DQNHYBRID_NAME,
+        "d-hybrida*": DQNHYBRID_NAME,
+    }
+    return aliases.get(slug, text)
+
+
+def parse_postprocess_allow(arg: Optional[str]) -> Optional[Set[str]]:
+    """
+    Parse a comma-separated allowlist of planners for postprocessing.
+    Returns None when all planners are allowed.
+    """
+    if arg is None:
+        return None
+    text = str(arg).strip()
+    if not text or text.lower() in ("all", "any", "*"):
+        return None
+    allowed: Set[str] = set()
+    for part in text.split(","):
+        name = normalize_planner_label(part)
+        if name:
+            allowed.add(strip_variant_suffix(name))
+    return allowed or None
 
 
 def path_length(path: List[AckermannState]) -> float:
@@ -324,10 +390,15 @@ def farthest_free_cells(free_mask: np.ndarray) -> Tuple[Tuple[int, int], Tuple[i
     return start_g, goal_g, max_steps, len(largest_component)
 
 
-def load_real_env1_map(cfg) -> Tuple[GridMap, AckermannState, AckermannState, dict]:
+def load_real_env1_map(
+    cfg,
+    start_override: Optional[Tuple[float, float, Optional[float]]] = None,
+    goal_override: Optional[Tuple[float, float, Optional[float]]] = None,
+) -> Tuple[GridMap, AckermannState, AckermannState, dict]:
     """
     Load the real_env1 occupancy grid + YAML, choose distant start/goal inside the
-    largest free component, and build a GridMap for planning.
+    largest free component, and build a GridMap for planning. Manual start/goal
+    overrides (x, y[, theta]) are supported for this map.
     """
     grid_path = Path(cfg.get("grid_path", REAL_ENV1_GRID))
     yaml_path = Path(cfg.get("yaml_path", REAL_ENV1_MAP_YAML))
@@ -345,15 +416,246 @@ def load_real_env1_map(cfg) -> Tuple[GridMap, AckermannState, AckermannState, di
 
     grid_mask = (occ != 0).astype(np.uint8)  # treat unknown (-1) as obstacles
     free_mask = occ == 0
+    grid_map = GridMap(grid_mask, resolution, origin_xy)
 
-    start_g, goal_g, max_steps, comp_size = farthest_free_cells(free_mask)
-    start_x = start_g[0] * resolution + origin_xy[0]
-    start_y = start_g[1] * resolution + origin_xy[1]
-    goal_x = goal_g[0] * resolution + origin_xy[0]
-    goal_y = goal_g[1] * resolution + origin_xy[1]
-    heading = math.atan2(goal_y - start_y, goal_x - start_x)
+    footprint_length = float(cfg.get("footprint_length", 0.924))
+    footprint_width = float(cfg.get("footprint_width", 0.740))
+    clearance_margin = cfg.get("start_goal_clearance", None)
+    if clearance_margin is None:
+        # Use the circumscribed radius of the robot footprint plus half a cell to guarantee clearance.
+        clearance_margin = math.hypot(footprint_length * 0.5, footprint_width * 0.5) + max(resolution * 0.5, 0.05)
+
+    def apply_boundary_clearance(mask: np.ndarray, boundary_clearance: float) -> np.ndarray:
+        """
+        Zero out cells that are too close to the grid boundary to keep endpoints off walls.
+        Falls back to the original mask if trimming would remove every free cell.
+        """
+        cells = int(math.ceil(boundary_clearance / resolution))
+        if cells <= 0:
+            return mask
+        trimmed = mask.copy()
+        trimmed[:cells, :] = False
+        trimmed[-cells:, :] = False
+        trimmed[:, :cells] = False
+        trimmed[:, -cells:] = False
+        return trimmed if int(np.count_nonzero(trimmed)) > 0 else mask
+
+    safe_mask = free_mask
+    if clearance_margin > 0.0:
+        inflated = grid_map.inflate(clearance_margin)
+        inflated_free_mask = inflated.data == 0
+        if int(np.count_nonzero(inflated_free_mask)) > 0:
+            safe_mask = inflated_free_mask
+        else:
+            clearance_margin = 0.0  # fall back if inflation removes every free cell
+
+    # Use a slightly looser mask to pick endpoints so the goal can shift farther left while remaining reachable.
+    endpoint_clearance = float(cfg.get("start_goal_clearance_factor", 0.55)) * clearance_margin
+    endpoint_mask = safe_mask
+    if clearance_margin > 0.0 and endpoint_clearance < clearance_margin:
+        inflated = grid_map.inflate(endpoint_clearance)
+        endpoint_free_mask = inflated.data == 0
+        if int(np.count_nonzero(endpoint_free_mask)) > 0:
+            endpoint_mask = endpoint_free_mask
+
+    boundary_clearance = float(cfg.get("boundary_clearance", max(0.8, clearance_margin * 0.75)))
+    safe_mask = apply_boundary_clearance(safe_mask, boundary_clearance)
+    endpoint_mask = apply_boundary_clearance(endpoint_mask, boundary_clearance)
+    clear_free_cells = int(np.count_nonzero(safe_mask))
+
+    footprint = OrientedBoxFootprint(footprint_length, footprint_width)
+    pose_checker = GridFootprintChecker(grid_map, footprint, theta_bins=72)
+    pose_checker_coarse = GridFootprintChecker(grid_map, footprint, theta_bins=48)
+
+    safe_start_g, safe_goal_g, _, _ = farthest_free_cells(safe_mask)
+    start_g, goal_g, max_steps, comp_size = farthest_free_cells(endpoint_mask)
+
+    def component_mask(mask: np.ndarray, seed_yx: Tuple[int, int]) -> np.ndarray:
+        """Return the connected component within mask containing seed_yx."""
+        h, w = mask.shape
+        visited = np.zeros_like(mask, dtype=bool)
+        sy, sx = seed_yx
+        if not mask[sy, sx]:
+            return visited
+        dq = deque([(sy, sx)])
+        visited[sy, sx] = True
+        while dq:
+            cy, cx = dq.popleft()
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    dq.append((ny, nx))
+        return visited
+
+    def shift_left(cell: Tuple[int, int], mask: np.ndarray, max_cells: int = 24) -> Tuple[int, int]:
+        """Slide a grid cell leftward to a nearby free spot to give the real map endpoints more margin."""
+        gx, gy = cell
+        for dx in range(1, max_cells + 1):
+            cand = gx - dx
+            if cand < 0:
+                break
+            if mask[gy, cand]:
+                return (cand, gy)
+        return cell
+
+    def distance_from(start_yx: Tuple[int, int], mask: np.ndarray) -> np.ndarray:
+        """Grid-distance flood fill limited to the True cells of `mask`."""
+        h, w = mask.shape
+        dist = np.full(mask.shape, -1, dtype=int)
+        sy, sx = start_yx
+        if not mask[sy, sx]:
+            return dist
+        dq = deque([(sy, sx)])
+        dist[sy, sx] = 0
+        while dq:
+            cy, cx = dq.popleft()
+            cd = dist[cy, cx]
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = cy + dy, cx + dx
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and dist[ny, nx] == -1:
+                    dist[ny, nx] = cd + 1
+                    dq.append((ny, nx))
+        return dist
+
+    comp_mask = component_mask(endpoint_mask, (start_g[1], start_g[0]))
+    manual_start = start_override or cfg.get("start_override")
+    manual_goal = goal_override or cfg.get("goal_override")
+
+    def world_to_grid(x: float, y: float) -> Tuple[int, int]:
+        gx = int(round((x - origin_xy[0]) / resolution))
+        gy = int(round((y - origin_xy[1]) / resolution))
+        return gx, gy
+
+    def validate_manual_pose(x: float, y: float, heading: float, label: str) -> Tuple[int, int]:
+        gx, gy = world_to_grid(x, y)
+        if not (0 <= gx < grid_mask.shape[1] and 0 <= gy < grid_mask.shape[0]):
+            raise ValueError(f"{label} pose ({x:.2f}, {y:.2f}) is outside the map bounds.")
+        if grid_mask[gy, gx] != 0:
+            raise ValueError(f"{label} pose ({x:.2f}, {y:.2f}) is not in free space (occupied/unknown cell).")
+        if not endpoint_mask[gy, gx]:
+            print(
+                f"Warning: {label} pose ({x:.2f}, {y:.2f}) is outside the clearance-inflated free space; using it anyway."
+            )
+        if pose_checker.collides_pose(x, y, heading):
+            raise ValueError(f"{label} pose ({x:.2f}, {y:.2f}) collides with obstacles for heading {heading:.2f} rad.")
+        return gx, gy
+
+    def nearest_reachable_cell(target_xy: Tuple[float, float], mask: np.ndarray) -> Optional[Tuple[int, int]]:
+        tgx, tgy = world_to_grid(target_xy[0], target_xy[1])
+        candidates = np.argwhere(mask)
+        if len(candidates) == 0:
+            return None
+        deltas = candidates - np.array([tgy, tgx])
+        d2 = deltas[:, 0] ** 2 + deltas[:, 1] ** 2
+        cy, cx = candidates[int(np.argmin(d2))]
+        return int(cx), int(cy)
+
+    use_manual = manual_start is not None or manual_goal is not None
+    preferred_applied = False
+    if comp_mask.any() and not use_manual and cfg.get("use_preferred_endpoints", True):
+        preferred_start = tuple(cfg.get("preferred_start", (2.0, 7.0)))
+        preferred_goal = tuple(cfg.get("preferred_goal", (-28.0, 7.0)))
+        candidate_mask = endpoint_mask & comp_mask
+        pref_start_cell = nearest_reachable_cell(preferred_start, candidate_mask)
+        pref_goal_cell = nearest_reachable_cell(preferred_goal, candidate_mask) if pref_start_cell else None
+        if pref_start_cell and pref_goal_cell:
+            start_g, goal_g = pref_start_cell, pref_goal_cell
+            preferred_applied = True
+
+    if use_manual:
+        default_start_xy = (start_g[0] * resolution + origin_xy[0], start_g[1] * resolution + origin_xy[1])
+        default_goal_xy = (goal_g[0] * resolution + origin_xy[0], goal_g[1] * resolution + origin_xy[1])
+        start_x = manual_start[0] if manual_start else default_start_xy[0]
+        start_y = manual_start[1] if manual_start else default_start_xy[1]
+        goal_x = manual_goal[0] if manual_goal else default_goal_xy[0]
+        goal_y = manual_goal[1] if manual_goal else default_goal_xy[1]
+        heading_guess = math.atan2(goal_y - start_y, goal_x - start_x)
+        start_heading = manual_start[2] if manual_start and len(manual_start) > 2 and manual_start[2] is not None else heading_guess
+        goal_heading = manual_goal[2] if manual_goal and len(manual_goal) > 2 and manual_goal[2] is not None else heading_guess
+        start_cell = validate_manual_pose(start_x, start_y, start_heading, "Start")
+        goal_cell = validate_manual_pose(goal_x, goal_y, goal_heading, "Goal")
+        mask_for_connectivity = endpoint_mask
+        if not endpoint_mask[start_cell[1], start_cell[0]] or not endpoint_mask[goal_cell[1], goal_cell[0]]:
+            mask_for_connectivity = free_mask
+        comp_mask_override = component_mask(mask_for_connectivity, (start_cell[1], start_cell[0]))
+        if comp_mask_override.any() and not comp_mask_override[goal_cell[1], goal_cell[0]]:
+            raise ValueError("Manual start/goal are not in the same free-space component; adjust the coordinates.")
+        start_g, goal_g = (start_cell[0], start_cell[1]), (goal_cell[0], goal_cell[1])
+        heading = start_heading
+        goal_heading = goal_heading
+    else:
+        goal_heading = None
+    if comp_mask.any() and not use_manual and not preferred_applied:
+        cols = np.where(comp_mask.any(axis=0))[0]
+        center_row = comp_mask.shape[0] // 2
+        # Bias the start upward a bit without hugging the boundary, and avoid parking the goal on the far-left wall.
+        preferred_start_row = max(0, center_row - int(comp_mask.shape[0] * 0.10))
+        goal_left_limit = min(cols[-1], cols[0] + int(max(2, round(grid_mask.shape[1] * 0.06))))
+        goal_cols_scan = [c for c in cols if c >= goal_left_limit] + [c for c in cols if c < goal_left_limit]
+
+        def rows_sorted(col: int, bias_row: int):
+            rows_on_col = np.where(comp_mask[:, col])[0]
+            return sorted(rows_on_col, key=lambda r: (abs(r - bias_row), abs(r - center_row)))
+
+        best = None  # (start_col, start_row, goal_col, goal_row)
+        for s_col in reversed(cols):  # prefer the rightmost viable start
+            start_rows = rows_sorted(int(s_col), preferred_start_row)
+            if not start_rows:
+                continue
+            for s_row in start_rows:
+                dist_map = distance_from((s_row, s_col), comp_mask)
+                start_x = s_col * resolution + origin_xy[0]
+                start_y = s_row * resolution + origin_xy[1]
+                if pose_checker_coarse.collides_pose(start_x, start_y, 0.0):
+                    continue
+                for g_col in goal_cols_scan:  # prefer goals that are left but not hugging the wall
+                    goal_rows = rows_sorted(int(g_col), center_row)
+                    if not goal_rows:
+                        continue
+                    for g_row in goal_rows:
+                        if dist_map[g_row, g_col] < 0:
+                            continue
+                        gx = g_col * resolution + origin_xy[0]
+                        gy = g_row * resolution + origin_xy[1]
+                        heading = math.atan2(gy - start_y, gx - start_x)
+                        if pose_checker_coarse.collides_pose(start_x, start_y, heading):
+                            continue
+                        if pose_checker_coarse.collides_pose(gx, gy, heading):
+                            continue
+                        if pose_checker.collides_pose(start_x, start_y, heading):
+                            continue
+                        if pose_checker.collides_pose(gx, gy, heading):
+                            continue
+                        cand = (s_col, s_row, g_col, g_row)
+                        if (best is None) or (g_col < best[2]) or (g_col == best[2] and s_col > best[0]):
+                            best = cand
+                        break  # stop scanning rows on this goal column
+                if best and best[0] == s_col and best[2] == goal_cols_scan[0]:
+                    break  # already achieved the leftmost possible goal within the preferred band for this start
+            if best and best[2] == goal_cols_scan[0]:
+                break  # cannot do better than the leftmost preferred goal overall
+        if best:
+            start_g, goal_g = (best[0], best[1]), (best[2], best[3])
+    elif not use_manual and not preferred_applied:
+        goal_g = shift_left(goal_g, safe_mask, max_cells=28)
+    if not use_manual:
+        start_x = start_g[0] * resolution + origin_xy[0]
+        start_y = start_g[1] * resolution + origin_xy[1]
+        goal_x = goal_g[0] * resolution + origin_xy[0]
+        goal_y = goal_g[1] * resolution + origin_xy[1]
+        heading = math.atan2(goal_y - start_y, goal_x - start_x)
+        if pose_checker.collides_pose(start_x, start_y, heading) or pose_checker.collides_pose(goal_x, goal_y, heading):
+            # Fall back to the conservative endpoints if the relaxed picks still collide.
+            start_g, goal_g = safe_start_g, safe_goal_g
+            start_x = start_g[0] * resolution + origin_xy[0]
+            start_y = start_g[1] * resolution + origin_xy[1]
+            goal_x = goal_g[0] * resolution + origin_xy[0]
+            goal_y = goal_g[1] * resolution + origin_xy[1]
+            heading = math.atan2(goal_y - start_y, goal_x - start_x)
+            goal_heading = heading
     start = AckermannState(start_x, start_y, heading)
-    goal = AckermannState(goal_x, goal_y, heading)
+    goal = AckermannState(goal_x, goal_y, goal_heading if goal_heading is not None else heading)
 
     size = (grid_mask.shape[1] * resolution, grid_mask.shape[0] * resolution)
     meta = dict(
@@ -364,8 +666,10 @@ def load_real_env1_map(cfg) -> Tuple[GridMap, AckermannState, AckermannState, di
         component_size=comp_size,
         max_grid_distance=max_steps,
         origin=origin_xy,
+        clear_free_cells=clear_free_cells,
+        start_goal_clearance=clearance_margin,
+        boundary_clearance=boundary_clearance,
     )
-    grid_map = GridMap(grid_mask, resolution, origin_xy)
     return grid_map, start, goal, meta
 
 
@@ -391,7 +695,7 @@ HYBRID_TIMEOUT = 5.0
 HYBRID_MAX_NODES = 8_000
 DQN_TIMEOUT = 5.0
 DQN_MAX_NODES = 8_000
-RRT_TIMEOUT = 5.0
+RRT_TIMEOUT = 10.0
 RRT_MAX_ITER = 30_000
 
 
@@ -534,6 +838,7 @@ def plot_with_boxes(
     planner_results: List[Tuple[str, List[AckermannState], dict]],
     footprint: OrientedBoxFootprint,
     out_dir: Path,
+    legend_labels: Optional[List[str]] = None,
 ):
     if plt is None or not planner_results:
         return None
@@ -568,6 +873,7 @@ def plot_with_boxes(
         color = PLANNER_COLOR_MAP.get(base_label, color_cycle[idx % len(color_cycle)])
         linestyle = "--" if "orig" in label.lower() else "-"
         linewidth = PRIMARY_LINEWIDTH * (0.85 if "orig" in label.lower() else 1.0)
+        legend_label = legend_labels[idx] if legend_labels and idx < len(legend_labels) else label
         xs = [p.x for p in path]
         ys = [p.y for p in path]
         ax.plot(
@@ -576,7 +882,7 @@ def plot_with_boxes(
             linewidth=linewidth,
             color=color,
             solid_capstyle="round",
-            label=label,
+            label=legend_label,
             linestyle=linestyle,
         )
         boxes = stats.get("trace_boxes", [])
@@ -631,21 +937,30 @@ def normalize_variant(name: str) -> str:
     return slug
 
 
-def build_variant(variant: str):
+def build_variant(
+    variant: str,
+    start_override: Optional[Tuple[float, float, Optional[float]]] = None,
+    goal_override: Optional[Tuple[float, float, Optional[float]]] = None,
+):
     variant_slug = normalize_variant(variant)
     cfg = FOREST_VARIANTS[variant_slug]
     title = cfg.get("title", f"Forest ({variant_slug})")
 
     if cfg.get("loader") == "real_env1":
-        grid_map, start, goal, meta = load_real_env1_map(cfg)
+        grid_map, start, goal, meta = load_real_env1_map(cfg, start_override=start_override, goal_override=goal_override)
         map_kwargs = {
             "size": meta["size"],
             "resolution": meta["resolution"],
             "num_trees": meta.get("obstacle_cells", "obs_cells"),
             "free_cells": meta.get("free_cells", None),
             "obstacle_cells": meta.get("obstacle_cells", None),
+            "clear_free_cells": meta.get("clear_free_cells", None),
+            "start_goal_clearance": meta.get("start_goal_clearance", None),
         }
         return variant_slug, title, map_kwargs, start, goal, grid_map
+
+    if start_override or goal_override:
+        print("Manual start/goal overrides are only applied to the real_env1 map; ignoring for synthetic variants.")
 
     map_kwargs = dict(FOREST_MAP_KWARGS)
     map_kwargs.update(cfg.get("map_kwargs", {}))
@@ -655,11 +970,22 @@ def build_variant(variant: str):
     return variant_slug, title, map_kwargs, start, goal, None
 
 
-def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Path] = None, postprocess: str = "none"):
+def plan_forest_scene(
+    variant: str = "large_map_small_gap",
+    out_dir: Optional[Path] = None,
+    postprocess: str = "none",
+    postprocess_allow: Optional[Set[str]] = None,
+    start_override: Optional[Tuple[float, float, Optional[float]]] = None,
+    goal_override: Optional[Tuple[float, float, Optional[float]]] = None,
+    legend_style: str = "standard",
+):
     output_dir = out_dir or (Path(__file__).resolve().parent / "outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
     post_mode = (postprocess or "none").strip().lower()
-    variant_slug, title, map_kwargs, start, goal, grid_map_override = build_variant(variant)
+    postprocess_allow = {strip_variant_suffix(p) for p in postprocess_allow} if postprocess_allow else None
+    variant_slug, title, map_kwargs, start, goal, grid_map_override = build_variant(
+        variant, start_override=start_override, goal_override=goal_override
+    )
     grid_map = grid_map_override or make_forest_map(**map_kwargs)
     size_x, size_y = map_kwargs.get(
         "size", (grid_map.data.shape[1] * grid_map.resolution, grid_map.data.shape[0] * grid_map.resolution)
@@ -683,6 +1009,10 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
             f"  Cells: free={map_kwargs['free_cells']:,}, "
             f"obstacles/unknown={map_kwargs.get('obstacle_cells', 'n/a')}"
         )
+    if map_kwargs.get("clear_free_cells") is not None:
+        clearance = map_kwargs.get("start_goal_clearance")
+        clearance_note = f" (>= {clearance:.2f} m from obstacles)" if clearance else ""
+        print(f"  Start/goal clear cells: {map_kwargs['clear_free_cells']:,}{clearance_note}")
     if map_kwargs.get("wall_y") is not None:
         gap_center, gap_width = map_kwargs["wall_gap"]
         print(f"  Wall at y={map_kwargs['wall_y']:.2f} with gap center={gap_center:.2f}, width={gap_width:.2f}")
@@ -700,10 +1030,11 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         goal_theta_tol=goal_theta_tol,
         theta_bins=48,
     )
-    hybrid_kwargs = dict(base_kwargs, heuristic_weight=1.8)
+    # Stronger heuristic to offset the tighter turning radius (28° steer) speeding up search on large maps.
+    hybrid_kwargs = dict(base_kwargs, heuristic_weight=2.5)
     dqn_kwargs = dict(base_kwargs, dqn_top_k=3, anchor_inflation=1.6, dqn_weight=1.1)
     rrt_kwargs = dict(
-        goal_sample_rate=0.80 if is_large_map else 0.90,  # strong bias, but leave room for exploration
+        goal_sample_rate=0.90,  # stronger bias helps when heading penalties tighten with higher steering limits
         neighbor_radius=5.0 if is_large_map else 2.8,
         step_time=1.20 if is_large_map else 0.50,  # small maps use tighter rollouts
         velocity=1.0,
@@ -712,10 +1043,10 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         goal_check_freq=1,
         seed_steps=4,
         collision_step=default_collision_step(grid_map.resolution, preferred=0.12 if is_large_map else 0.10, max_step=0.20),
-        lazy_collision=False,
         rewire=False,
-        theta_bins=48,
     )
+    rrt_timeout = RRT_TIMEOUT
+    rrt_max_iter = RRT_MAX_ITER
     apf_kwargs = dict(
         step_size=0.22,
         goal_tol=max(goal_xy_tol, 0.25 if is_large_map else 0.18),
@@ -729,15 +1060,14 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         min_step=0.05,
         jitter_angle=0.6,
         heading_rate=0.65,
-        coarse_collision=False,
     )
     # Variants can override RRT tuning; the sparse small-map-with-gap benefits from longer strides + looser heading.
     if not is_large_map and variant_slug == "small_map_large_gap":
         rrt_kwargs.update(
             dict(
-                goal_sample_rate=0.80,
+                goal_sample_rate=0.90,
                 neighbor_radius=3.5,
-                step_time=0.80,
+                step_time=0.60,
                 goal_theta_tol=max(goal_theta_tol, math.radians(35.0)),
                 seed_steps=6,
                 collision_step=default_collision_step(grid_map.resolution, preferred=0.10, max_step=0.20),
@@ -746,21 +1076,38 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
     if is_large_map and variant_slug == "large_map_small_gap":
         rrt_kwargs.update(
             dict(
-                goal_sample_rate=0.80,
-                neighbor_radius=5.0,
-                step_time=1.20,
+                goal_sample_rate=0.20,
+                neighbor_radius=3.0,
+                step_time=0.40,
                 velocity=1.0,
-                goal_xy_tol=max(goal_xy_tol, 0.40),
-                goal_theta_tol=max(goal_theta_tol, math.radians(45.0)),
-                seed_steps=2,
-                collision_step=default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25),
+                goal_xy_tol=max(goal_xy_tol, 0.42),
+                goal_theta_tol=max(goal_theta_tol, math.radians(75.0)),
+                seed_steps=0,
+                collision_step=default_collision_step(grid_map.resolution, preferred=0.10, max_step=0.20),
+                rewire=False,
+                steer_jitter=0.25,
             )
         )
+        rrt_timeout = max(rrt_timeout, 18.0)
+        rrt_max_iter = max(rrt_max_iter, 60_000)
 
     # Slightly loosen APF heading dynamics on the hardest scene to preserve success while smoothing later.
     apf_kwargs_variant = dict(apf_kwargs)
     if variant_slug == "large_map_small_gap":
         apf_kwargs_variant.update(dict(jitter_angle=0.8, heading_rate=0.72))
+    if variant_slug == "real_env1":
+        apf_kwargs_variant.update(
+            dict(
+                step_size=0.24,
+                repulse_radius=0.95,
+                obstacle_gain=0.85,
+                goal_gain=1.35,
+                heading_rate=0.70,
+                jitter_angle=0.5,
+                stall_steps=90,
+                min_step=0.06,
+            )
+        )
 
     post_checker = GridFootprintChecker(grid_map, footprint, theta_bins=72)
     planners = [
@@ -805,9 +1152,11 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
                 }
             )
     for label, planner in planners:
+        base_label = strip_variant_suffix(label)
+        allow_postprocess = postprocess_allow is None or base_label in postprocess_allow
         t0 = time.time()
         if isinstance(planner, RRTStarPlanner):
-            path, stats = planner.plan(start, goal, max_iter=RRT_MAX_ITER, timeout=RRT_TIMEOUT)
+            path, stats = planner.plan(start, goal, max_iter=rrt_max_iter, timeout=rrt_timeout)
         elif isinstance(planner, DQNHybridAStarPlanner):
             path, stats = planner.plan(start, goal, timeout=DQN_TIMEOUT, max_nodes=DQN_MAX_NODES)
         elif isinstance(planner, HybridAStarPlanner):
@@ -822,7 +1171,7 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         raw_path = list(path)
         path_len = path_length(raw_path)
         plot_entries = []
-        if success and post_mode in ("stomp", "feng"):
+        if success and post_mode in ("stomp", "feng") and allow_postprocess:
             plot_entries.append((f"{label} (orig)", raw_path, dict(stats)))
             opt_t0 = time.time()
             post_input_path = reorient_path_headings(raw_path)
@@ -896,46 +1245,46 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
                 opt_info["max_deviation"] = max_dev
                 opt_info["no_change_tol"] = no_change_tol
                 no_change = math.isfinite(max_dev) and max_dev <= no_change_tol
-                # If Feng falls back to the original or returns an empty/unchanged path, force a STOMP pass
-                # to ensure we still output a smoothed trajectory.
-                if (
+                # If Feng returns empty/unchanged, retry Feng with a heavier second pass (same method, different seed).
+                retry_needed = (
                     not opt_path
                     or opt_info.get("reason") == "fallback_to_input"
                     or paths_match(opt_path, post_input_path)
                     or no_change
-                ):
-                    stomp_fallback_info = {}
-                    stomp_path, stomp_fallback_info = stomp_optimize_path(
+                )
+                if retry_needed:
+                    second_path, second_info = feng_optimize_path(
                         post_input_path,
                         grid_map,
                         footprint,
                         params,
-                        step_size=0.25,
-                        ds_check=base_collision_step,
-                        rollouts=64,
-                        iters=35,
-                        lambda_=0.7,
-                        w_clear=0.6,
-                        w_goal=2.5,
-                        w_prior=0.1,
-                        w_track=0.05,
-                        allow_reverse=True,
-                        seed=21,
                         goal=goal,
-                        laplacian_strength=0.38,
+                        degree=5,
+                        max_segments=12,
+                        samples_per_seg=16,
+                        rect_size=3.0,
+                        safety_margin=0.22,
+                        output_step=0.22,
+                        ds_check=base_collision_step,
+                        iters=80,
+                        lr=0.09,
+                        w_terrain=1.4,
+                        w_safety=28.0,
+                        w_dyn=5.0,
+                        w_cont=6.0,
+                        w_track=0.10,
+                        seed=19,
                     )
-                    opt_info["fallback"] = {
-                        "mode": "stomp",
-                        "reason": opt_info.get("reason", "feng_no_change"),
-                        "stomp_reason": stomp_fallback_info.get("reason"),
-                        "stomp_improved": stomp_fallback_info.get("improved"),
-                        "stomp_selected_cost": stomp_fallback_info.get("selected_cost", stomp_fallback_info.get("best_cost")),
-                        "stomp_max_deviation": max_dev,
-                    }
-                    if stomp_path:
-                        opt_path = stomp_path
-                        suffix = "feng+stomp"
-                        opt_info["reason"] = "feng_fallback_to_stomp"
+                    opt_info["second_pass"] = second_info
+                    if second_path:
+                        opt_path = second_path
+                        opt_info["reason"] = second_info.get("reason", "feng_second_pass")
+                        opt_info["best_cost"] = second_info.get("best_cost", opt_info.get("best_cost"))
+                        opt_info["improved"] = second_info.get("improved", opt_info.get("improved"))
+                        opt_info["iters_run"] = second_info.get("iters_run", opt_info.get("iters_run"))
+                        opt_info["selected_pass"] = "second"
+                        max_dev = max_xy_deviation(raw_path, opt_path, samples=96)
+                        opt_info["max_deviation"] = max_dev
                     else:
                         opt_info.setdefault("reason", "feng_no_change")
             if not opt_path:
@@ -971,6 +1320,7 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
             stats["postprocess_time"] = time.time() - opt_t0
             path_len = path_length(opt_path)
             plot_entries.append((f"{label} ({suffix})", opt_path, dict(stats)))
+            # Keep the optimized curve (including STOMP fallbacks) in exports/plots.
             path = opt_path
         print(
             f"{label}: success={success}, time={stats.get('time',0):.2f}s, "
@@ -1009,6 +1359,12 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
                 planner_results.append((label, path, stats))
                 add_path_rows(label, path)
 
+    legend_labels = None
+    if legend_style == "ambiguous" and planner_results:
+        legend_labels = [
+            AMBIGUOUS_LEGEND_NAMES[i % len(AMBIGUOUS_LEGEND_NAMES)] for i in range(len(planner_results))
+        ]
+
     saved_plot = plot_with_boxes(
         title,
         variant_slug,
@@ -1018,6 +1374,7 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         planner_results,
         footprint,
         output_dir,
+        legend_labels=legend_labels,
     )
     if saved_plot:
         print(f"Saved plot: {saved_plot}")
@@ -1037,9 +1394,24 @@ def plan_forest_scene(variant: str = "large_map_small_gap", out_dir: Optional[Pa
         size_y=size_y,
         num_trees=map_kwargs.get("num_trees", ""),
         postprocess=post_mode if post_mode in ("stomp", "feng") else "none",
+        postprocess_allow=",".join(sorted(postprocess_allow)) if postprocess_allow else "all",
+        legend_style=legend_style or "standard",
     )
 
     return records, saved_plot, run_info, path_export_rows
+
+
+def parse_pose_arg(arg: str, name: str) -> Tuple[float, float, Optional[float]]:
+    parts = [p.strip() for p in arg.split(",") if p.strip()]
+    if len(parts) not in (2, 3):
+        raise argparse.ArgumentTypeError(f"{name} must be 'x,y' or 'x,y,theta' (meters, radians).")
+    try:
+        values = [float(p) for p in parts]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"{name} values must be numeric (meters, radians).") from exc
+    if len(values) == 2:
+        values.append(None)
+    return values[0], values[1], values[2]
 
 
 def parse_args():
@@ -1061,6 +1433,27 @@ def parse_args():
         default="none",
         help="Apply a trajectory postprocessor after planning (default: none).",
     )
+    parser.add_argument(
+        "--postprocess-allow",
+        default="all",
+        help="Comma-separated planners to postprocess (e.g., 'APF,RRT'). Use 'all' to keep the default behavior.",
+    )
+    parser.add_argument(
+        "--legend-style",
+        choices=["standard", "ambiguous"],
+        default="standard",
+        help="Legend labeling style. Choose 'ambiguous' for supplementary figures with similar-looking legend entries.",
+    )
+    parser.add_argument(
+        "--start",
+        type=lambda s: parse_pose_arg(s, "start"),
+        help="Manual start pose 'x,y[,theta]' in meters/radians (real_env1 only).",
+    )
+    parser.add_argument(
+        "--goal",
+        type=lambda s: parse_pose_arg(s, "goal"),
+        help="Manual goal pose 'x,y[,theta]' in meters/radians (real_env1 only).",
+    )
     return parser.parse_args()
 
 
@@ -1074,10 +1467,19 @@ if __name__ == "__main__":
     all_records = []
     all_run_info = []
     all_path_rows = []
+    postprocess_allow = parse_postprocess_allow(args.postprocess_allow)
     variants = list(FOREST_VARIANTS) if args.variant.strip().lower() in ("all", "any") else [args.variant]
     for variant_name in variants:
         print("\n" + "=" * 60)
-        records, _, run_info, path_rows = plan_forest_scene(variant_name, out_dir=out_dir, postprocess=args.postprocess)
+        records, _, run_info, path_rows = plan_forest_scene(
+            variant_name,
+            out_dir=out_dir,
+            postprocess=args.postprocess,
+            postprocess_allow=postprocess_allow,
+            start_override=args.start,
+            goal_override=args.goal,
+            legend_style=args.legend_style,
+        )
         all_records.extend(records)
         all_run_info.append(run_info)
         all_path_rows.extend(path_rows)
@@ -1132,6 +1534,8 @@ if __name__ == "__main__":
             "size_y",
             "num_trees",
             "postprocess",
+            "postprocess_allow",
+            "legend_style",
         ]
         meta.append(meta_headers)
         for row in run_rows:

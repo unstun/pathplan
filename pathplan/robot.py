@@ -8,7 +8,7 @@ from .common import wrap_angle
 @dataclass
 class AckermannParams:
     wheelbase: float = 0.6
-    min_turn_radius: float = 1.6
+    min_turn_radius: float = 1.1284
     v_max: float = 1.0
 
     @property

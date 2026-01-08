@@ -1,6 +1,6 @@
 import math
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -50,24 +50,16 @@ class OrientedBoxFootprint:
         y: float,
         theta: float,
         sample_step: float = 0.05,
+        theta_bins: int = 72,
     ) -> bool:
-        """Collision test by sampling grid cell centers within bounding square."""
-        radius = math.hypot(self.half_length, self.half_width)
-        step = max(sample_step, 1e-6)
-        minx = x - radius
-        maxx = x + radius
-        miny = y - radius
-        maxy = y + radius
-        px = minx
-        while px <= maxx + 1e-9:
-            py = miny
-            while py <= maxy + 1e-9:
-                if self.point_inside(px, py, x, y, theta):
-                    if grid_map.is_occupied(px, py):
-                        return True
-                py += step
-            px += step
-        return False
+        """
+        Collision test using the shared GridFootprintChecker.
+
+        `sample_step` is retained for backward compatibility but the checker
+        always relies on the grid-aligned footprint offsets.
+        """
+        checker = GridFootprintChecker(grid_map, self, theta_bins)
+        return checker.collides_pose(x, y, theta)
 
 
 def _footprint_offsets_for_heading(
@@ -76,6 +68,7 @@ def _footprint_offsets_for_heading(
     """
     Compute grid offsets whose cell centers fall inside the footprint at a given heading.
     Offsets are returned as integer (dx, dy) in grid cells relative to the robot center cell.
+    `padding` expands the footprint equally on all sides (meters).
     """
     hl = footprint.half_length + padding
     hw = footprint.half_width + padding
@@ -101,9 +94,14 @@ class GridFootprintChecker:
     Grid-based collision checker that precomputes footprint cell offsets per heading bin.
     """
 
-    def __init__(self, grid_map, footprint: OrientedBoxFootprint, theta_bins: int, padding: float = 0.0):
+    def __init__(
+        self, grid_map, footprint: OrientedBoxFootprint, theta_bins: int, padding: Optional[float] = None
+    ):
         self.map = grid_map
         self.theta_bins = theta_bins
+        # Default padding inflates the collision footprint by one cell on each side
+        # (adds 2 * resolution to length/width) for more conservative checks.
+        self.padding = grid_map.resolution if padding is None else padding
         # Cache a boolean view of the occupancy grid for fast numpy indexing.
         self._occ = np.asarray(grid_map.data, dtype=bool)
         self._h, self._w = self._occ.shape
@@ -112,7 +110,7 @@ class GridFootprintChecker:
         for i in range(theta_bins):
             theta = (2.0 * math.pi * i) / theta_bins
             offsets = np.asarray(
-                _footprint_offsets_for_heading(footprint, grid_map.resolution, theta, padding), dtype=np.int32
+                _footprint_offsets_for_heading(footprint, grid_map.resolution, theta, self.padding), dtype=np.int32
             )
             self.offsets.append(offsets)
             if offsets.size:
@@ -191,14 +189,11 @@ def motion_collides(
     start: Tuple[float, float, float],
     end: Tuple[float, float, float],
     step: float = 0.05,
+    theta_bins: int = 72,
 ) -> bool:
-    """Check collision along motion by sampling intermediate poses."""
-    if footprint.collides(grid_map, start[0], start[1], start[2], sample_step=step):
-        return True
-    for pose in interpolate_poses(start, end, step):
-        if footprint.collides(grid_map, pose[0], pose[1], pose[2], sample_step=step):
-            return True
-    return False
+    """Check collision along motion using the unified GridFootprintChecker."""
+    checker = GridFootprintChecker(grid_map, footprint, theta_bins)
+    return checker.motion_collides(start, end, step=step)
 
 
 def path_collides(
@@ -206,9 +201,8 @@ def path_collides(
     footprint: OrientedBoxFootprint,
     poses: Iterable[Tuple[float, float, float]],
     sample_step: float = 0.05,
+    theta_bins: int = 72,
 ) -> bool:
-    """Check collision for a sequence of poses (e.g., an arc trace)."""
-    for x, y, theta in poses:
-        if footprint.collides(grid_map, x, y, theta, sample_step=sample_step):
-            return True
-    return False
+    """Check collision for a sequence of poses using the unified GridFootprintChecker."""
+    checker = GridFootprintChecker(grid_map, footprint, theta_bins)
+    return checker.collides_path(poses)

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, List, Tuple, Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -303,10 +304,28 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(0)
 
-    device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+    requested_device = args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested_device)
+    if device.type == "cuda":
+        if not (torch.cuda.is_available() and torch.backends.cuda.is_built()):
+            print("CUDA requested but not available/compiled; falling back to CPU.")
+            device = torch.device("cpu")
+        else:
+            try:
+                idx = device.index if device.index is not None else 0
+                props = torch.cuda.get_device_properties(idx)
+                arch = f"sm_{props.major}{props.minor}"
+                compiled_arches = set(torch.cuda.get_arch_list())
+                if arch not in compiled_arches:
+                    print(
+                        f"CUDA device compute capability {arch} is not supported by this PyTorch build; falling back to CPU."
+                    )
+                    device = torch.device("cpu")
+            except Exception as exc:  # safeguard if querying properties fails
+                print(f"Could not validate CUDA device; falling back to CPU ({exc}).")
+                device = torch.device("cpu")
+
     print(f"Using device: {device}")
-    if device.type != "cuda":
-        print("CUDA not available, falling back to CPU.")
 
     env = DQNEnv(max_steps=args.max_steps)
     policy_net = ConvGuidanceNet(num_actions=len(env.primitives), patch_cells=env.patch_cells).to(device)
@@ -318,10 +337,15 @@ def main():
     epsilon = args.eps_start
     last_loss = 0.0
     success_counter = 0
+    episode_rewards: List[float] = []
+    epsilon_history: List[float] = []
+    loss_history: List[float] = []
+    success_history: List[int] = []
 
     for episode in range(1, args.episodes + 1):
         obs = env.reset()
         episode_reward = 0.0
+        episode_success = 0
         for _ in range(env.max_steps):
             action = select_action(policy_net, obs, epsilon, device)
             next_obs, reward, done, info = env.step(action)
@@ -333,6 +357,7 @@ def main():
                 last_loss = loss_val
             if done:
                 success_counter += int(info.get("success", False))
+                episode_success = int(info.get("success", False))
                 break
 
         epsilon = max(args.eps_final, epsilon * args.eps_decay)
@@ -347,6 +372,11 @@ def main():
                 f"epsilon={epsilon:.3f}, success_rate(last 10)={avg_success:.2f}"
             )
 
+        episode_rewards.append(episode_reward)
+        epsilon_history.append(epsilon)
+        loss_history.append(last_loss)
+        success_history.append(episode_success)
+
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -356,6 +386,35 @@ def main():
         args.save_path,
     )
     print(f"Saved trained model to {args.save_path}")
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    episodes = np.arange(1, len(episode_rewards) + 1)
+    ax1.plot(episodes, episode_rewards, label="Episode reward", color="tab:blue", alpha=0.6)
+    window = 20
+    if len(episode_rewards) >= window:
+        kernel = np.ones(window) / window
+        rolling = np.convolve(episode_rewards, kernel, mode="valid")
+        ax1.plot(episodes[window - 1 :], rolling, label=f"{window}-episode avg", color="tab:red")
+    ax1.set_xlabel("Episode")
+    ax1.set_ylabel("Reward")
+    ax1.grid(alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.plot(episodes, epsilon_history, label="Epsilon", color="tab:green", alpha=0.35)
+    ax2.set_ylabel("Epsilon")
+
+    lines, labels = [], []
+    for ax in (ax1, ax2):
+        h, l = ax.get_legend_handles_labels()
+        lines.extend(h)
+        labels.extend(l)
+    ax1.legend(lines, labels, loc="upper right")
+    fig.tight_layout()
+
+    plot_path = args.save_path.with_suffix(".png")
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved training plot to {plot_path}")
 
 
 if __name__ == "__main__":

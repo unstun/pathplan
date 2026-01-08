@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from .common import heading_diff, default_collision_step
 from .geometry import GridFootprintChecker
 from .heuristics import admissible_heuristic
@@ -55,6 +57,12 @@ class DQNHybridAStarPlanner:
         dqn_weight: float = 1.0,
         dqn_lead_threshold: float = 1.0,
         max_dqn_streak: int = 3,
+        reverse_penalty: float = 0.2,
+        heading_weight: float = 0.05,
+        clearance_weight: float = 0.05,
+        clearance_patch_size: float = 4.0,
+        clearance_patch_cells: int = 16,
+        greedy_anchor_order: bool = True,
     ):
         self.map = grid_map
         self.footprint = footprint
@@ -70,6 +78,12 @@ class DQNHybridAStarPlanner:
         self.dqn_weight = dqn_weight
         self.dqn_lead_threshold = dqn_lead_threshold
         self.max_dqn_streak = max(1, max_dqn_streak)
+        self.reverse_penalty = reverse_penalty
+        self.heading_weight = heading_weight
+        self.clearance_weight = clearance_weight
+        self.clearance_patch_size = clearance_patch_size
+        self.clearance_patch_cells = clearance_patch_cells
+        self.greedy_anchor_order = greedy_anchor_order
         self.dqn = DQNGuidance(params)
         self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
@@ -88,6 +102,51 @@ class DQNHybridAStarPlanner:
 
     def _anchor_priority(self, node: Node) -> float:
         return node.g + self.anchor_inflation * node.h_anchor
+
+    def _heading_error_cost(self, state: AckermannState, goal: AckermannState) -> float:
+        if self.heading_weight <= 0.0:
+            return 0.0
+        goal_vec_heading = math.atan2(goal.y - state.y, goal.x - state.x)
+        to_goal = abs(heading_diff(goal_vec_heading, state.theta))
+        goal_heading = abs(heading_diff(goal.theta, state.theta))
+        return self.heading_weight * self.params.min_turn_radius * (to_goal + 0.5 * goal_heading)
+
+    def _clearance_cost(self, state: AckermannState) -> float:
+        if self.clearance_weight <= 0.0:
+            return 0.0
+        patch = self.map.occupancy_patch(
+            state.x, state.y, state.theta, size_m=self.clearance_patch_size, cells=self.clearance_patch_cells
+        )
+        front = patch[self.clearance_patch_cells // 2 :, self.clearance_patch_cells // 3 : 2 * self.clearance_patch_cells // 3]
+        front_occ = float(np.mean(front))
+        return self.clearance_weight * front_occ
+
+    def _evaluate_primitive(
+        self, current: Node, prim: MotionPrimitive, goal: AckermannState
+    ) -> Optional[Tuple[AckermannState, float, float, float, Tuple[float, float, float, float], float, float, float]]:
+        arc_states, _ = sample_constant_steer_motion(
+            current.state,
+            prim.steering,
+            prim.direction,
+            prim.step,
+            self.params,
+            step=self.collision_step,
+            footprint=None,
+        )
+        nxt = arc_states[-1]
+        if self.collision_checker.collides_path(arc_states):
+            return None
+        g_new = current.g + primitive_cost(prim)
+        if current.action and prim.direction != current.action.direction:
+            g_new += self.reverse_penalty
+        g_new += self._heading_error_cost(nxt, goal)
+        g_new += self._clearance_cost(nxt)
+
+        h_a_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
+        dqn_feats, dqn_front_occ, dqn_heading_err = self.dqn.evaluate(nxt.as_tuple(), goal.as_tuple(), self.map)
+        h_dqn_new = self.dqn.value_from_features(dqn_feats)
+        order_score = g_new + self.anchor_inflation * h_a_new
+        return nxt, g_new, h_a_new, h_dqn_new, dqn_feats, dqn_front_occ, dqn_heading_err, order_score
 
     def plan(
         self,
@@ -253,28 +312,35 @@ class DQNHybridAStarPlanner:
                     chosen = idx[:k]
                     actions = [self.primitives[i] for i in chosen]
 
+                candidates: List[
+                    Tuple[
+                        AckermannState,
+                        float,
+                        float,
+                        float,
+                        Tuple[float, float, float, float],
+                        float,
+                        float,
+                        float,
+                        MotionPrimitive,
+                    ]
+                ] = []
                 for prim in actions:
-                    arc_states, _ = sample_constant_steer_motion(
-                        current.state,
-                        prim.steering,
-                        prim.direction,
-                        prim.step,
-                        self.params,
-                        step=self.collision_step,
-                        footprint=None,
-                    )
-                    nxt = arc_states[-1]
-                    if self.collision_checker.collides_path(arc_states):
+                    evaluated = self._evaluate_primitive(current, prim, goal)
+                    if evaluated is None:
                         continue
-                    g_new = current.g + primitive_cost(prim)
-                    if current.action and prim.direction != current.action.direction:
-                        g_new += 0.2
+                    nxt, g_new, h_a_new, h_dqn_new, dqn_feats, dqn_front_occ, dqn_heading_err, order_score = evaluated
+                    candidates.append(
+                        (nxt, g_new, h_a_new, h_dqn_new, dqn_feats, dqn_front_occ, dqn_heading_err, order_score, prim)
+                    )
+
+                if use_anchor and self.greedy_anchor_order:
+                    candidates.sort(key=lambda c: c[7])
+
+                for nxt, g_new, h_a_new, h_dqn_new, dqn_feats, dqn_front_occ, dqn_heading_err, _, prim in candidates:
                     new_key = self._discretize(nxt)
                     if new_key in visited and visited[new_key] <= g_new:
                         continue
-                    h_a_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
-                    dqn_feats, dqn_front_occ, dqn_heading_err = self.dqn.evaluate(nxt.as_tuple(), goal.as_tuple(), self.map)
-                    h_dqn_new = self.dqn.value_from_features(dqn_feats)
                     node = Node(
                         nxt,
                         g=g_new,

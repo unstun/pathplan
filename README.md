@@ -13,17 +13,17 @@ Python scaffold for Ackermann planners (APF, Hybrid A*, D-Hybrid A* (DQN-guided 
 
 ## Robot + collision model (ground truth from code)
 
-- Ackermann params: `wheelbase=0.6 m`, `min_turn_radius=1.6 m` → `|steer| ≤ 0.359 rad` (`AckermannParams`).
+- Ackermann params: `wheelbase=0.6 m`, `min_turn_radius=1.1284 m` → `|steer| ≤ 0.489 rad` (28°, `AckermannParams`).
 - Footprint: oriented rectangle `0.924 m x 0.740 m` shared by every planner (`OrientedBoxFootprint`).
-- Collision: `GridFootprintChecker` precomputes, per heading bin, all grid-cell centers that lie inside the footprint (optional `padding`). `collides_pose` tests those centers; `collides_path`/`motion_collides` sample poses along a segment at `collision_step`. This center-based test can visually graze obstacles; add padding or inflate the map for stricter clearance.
+- Collision: `GridFootprintChecker` precomputes, per heading bin, all grid-cell centers that lie inside the footprint. It now pads the collision footprint by one map cell on every side by default (adds `2 * resolution` to length/width) while leaving the drawn footprint unchanged; set `padding=0.0` to match the visual box. `collides_pose` tests those centers; `collides_path`/`motion_collides` sample poses along a segment at `collision_step`. This center-based test can visually graze obstacles; increase padding or inflate the map for stricter clearance.
 - Maps: `GridMap` with world/grid transforms, random free-state sampling, occupancy patches for guidance, and simple inflation (`inflate`) for safety buffers.
 
 ## Planners (defaults in constructors)
 
 - **Hybrid A\*** (`HybridAStarPlanner`): 10 primitives (`default_primitives`, step `0.3 m`, reverse weight `1.2`), cusp penalty `0.2`, heading bins `72`, `collision_step≈0.1 m` (clamped), goal tolerances `0.1 m / 5°`, heuristic = Reeds-Shepp-style lower bound. `xy_resolution` defaults to the map resolution unless overridden (forests use coarser `0.60 m`, 48 bins).
 - **D-Hybrid A\*** (`DQNHybridAStarPlanner`, DQN-guided Hybrid A*): same lattice, dual queues (anchor + DQN). DQN branch uses lightweight hand-tuned `DQNGuidance` unless you swap in `TorchDQNGuidance`. Config: `dqn_top_k`, `dqn_weight`, `anchor_inflation`, `dqn_lead_threshold`, `max_dqn_streak`.
-- **Informed RRT\*** (`RRTStarPlanner`, kinodynamic): forward-simulate bicycle for `step_time=0.6 s` at `velocity=0.8 m/s`, goal bias `0.2`, neighbor radius `1.5 m`, goal tolerances `0.1 m / 5°`, optional rewiring, `collision_step` uses the shared default, `theta_bins=72`, `lazy_collision` switch for goal-only checks.
-- **APF** (`APFPlanner`, Artificial Potential Field): attractive + repulsive potentials over a precomputed obstacle distance map, curvature-limited heading rate, `collision_step` uses the shared default. Can run coarse (point) collision via `coarse_collision=True` or use the footprint checker.
+- **Informed RRT\*** (`RRTStarPlanner`, kinodynamic): forward-simulate bicycle for `step_time=0.6 s` at `velocity=0.8 m/s`, goal bias `0.2`, neighbor radius `1.5 m`, goal tolerances `0.1 m / 5°`, optional rewiring, `collision_step` uses the shared default and collision is evaluated on-the-fly at every integration step (no lazy collision or heading-bin precomputation).
+- **APF** (`APFPlanner`, Artificial Potential Field): attractive + repulsive potentials over a precomputed obstacle distance map, curvature-limited heading rate, `collision_step` uses the shared default and always relies on the footprint collision checker.
 
 ## Install & run
 
@@ -86,7 +86,7 @@ Swap in `DQNHybridAStarPlanner` for the D-Hybrid A* variant or `RRTStarPlanner` 
 
 ## Extending / safety knobs
 
-- Inflate obstacles: `GridMap.inflate(margin)` or add `padding` to `GridFootprintChecker` to make center-based collision conservative.
+- Inflate obstacles: `GridMap.inflate(margin)` or bump `GridFootprintChecker.padding` above the map-resolution default to make center-based collision more conservative.
 - Change actions: `default_primitives(params, step_length, delta_scale)` or custom `MotionPrimitive` list.
 - Tune heuristics: replace `admissible_heuristic` in planners for domain-specific bounds.
 - Adjust fidelity: smaller `collision_step`, more `theta_bins` → stricter collision/heading resolution; larger values → faster/looser.

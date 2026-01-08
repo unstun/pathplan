@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 from .common import heading_diff, default_collision_step
 from .geometry import GridFootprintChecker
 from .heuristics import admissible_heuristic
@@ -38,6 +40,12 @@ class HybridAStarPlanner:
         goal_xy_tol: float = 0.1,
         goal_theta_tol: float = math.radians(5.0),
         heuristic_weight: float = 1.0,
+        reverse_penalty: float = 0.2,
+        heading_weight: float = 0.05,
+        clearance_weight: float = 0.05,
+        clearance_patch_size: float = 4.0,
+        clearance_patch_cells: int = 16,
+        greedy_action_order: bool = True,
     ):
         self.map = grid_map
         self.footprint = footprint
@@ -49,6 +57,12 @@ class HybridAStarPlanner:
         self.goal_xy_tol = goal_xy_tol
         self.goal_theta_tol = goal_theta_tol
         self.heuristic_weight = max(heuristic_weight, 1e-6)
+        self.reverse_penalty = reverse_penalty
+        self.heading_weight = heading_weight
+        self.clearance_weight = clearance_weight
+        self.clearance_patch_size = clearance_patch_size
+        self.clearance_patch_cells = clearance_patch_cells
+        self.greedy_action_order = greedy_action_order
         self.collision_checker = GridFootprintChecker(grid_map, footprint, theta_bins)
 
     def _discretize(self, state: AckermannState) -> Tuple[int, int, int]:
@@ -66,6 +80,49 @@ class HybridAStarPlanner:
 
     def _priority(self, node: Node) -> float:
         return node.g + self.heuristic_weight * node.h
+
+    def _heading_error_cost(self, state: AckermannState, goal: AckermannState) -> float:
+        if self.heading_weight <= 0.0:
+            return 0.0
+        # Penalize deviation from both goal heading and pointing toward the goal position.
+        goal_vec_heading = math.atan2(goal.y - state.y, goal.x - state.x)
+        to_goal = abs(heading_diff(goal_vec_heading, state.theta))
+        goal_heading = abs(heading_diff(goal.theta, state.theta))
+        return self.heading_weight * self.params.min_turn_radius * (to_goal + 0.5 * goal_heading)
+
+    def _clearance_cost(self, state: AckermannState) -> float:
+        if self.clearance_weight <= 0.0:
+            return 0.0
+        patch = self.map.occupancy_patch(
+            state.x, state.y, state.theta, size_m=self.clearance_patch_size, cells=self.clearance_patch_cells
+        )
+        front = patch[self.clearance_patch_cells // 2 :, self.clearance_patch_cells // 3 : 2 * self.clearance_patch_cells // 3]
+        front_occ = float(np.mean(front))
+        return self.clearance_weight * front_occ
+
+    def _evaluate_primitive(
+        self, current: Node, prim: MotionPrimitive, goal: AckermannState
+    ) -> Optional[Tuple[AckermannState, float, float, float]]:
+        arc_states, _ = sample_constant_steer_motion(
+            current.state,
+            prim.steering,
+            prim.direction,
+            prim.step,
+            self.params,
+            step=self.collision_step,
+            footprint=None,
+        )
+        nxt = arc_states[-1]
+        if self.collision_checker.collides_path(arc_states):
+            return None
+        g_new = current.g + primitive_cost(prim)
+        if current.action and prim.direction != current.action.direction:
+            g_new += self.reverse_penalty
+        g_new += self._heading_error_cost(nxt, goal)
+        g_new += self._clearance_cost(nxt)
+        h_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
+        order_score = g_new + self.heuristic_weight * h_new
+        return nxt, g_new, h_new, order_score
 
     def plan(
         self,
@@ -141,26 +198,19 @@ class HybridAStarPlanner:
                     return path, self._stats(path, expansions, time.time() - start_time, trace_poses, trace_boxes, failure_reason=None, remediations=remediations)
 
                 expansions += 1
+                candidates: List[Tuple[AckermannState, float, float, float, MotionPrimitive]] = []
                 for prim in primitives:
-                    arc_states, _ = sample_constant_steer_motion(
-                        current.state,
-                        prim.steering,
-                        prim.direction,
-                        prim.step,
-                        self.params,
-                        step=self.collision_step,
-                        footprint=None,
-                    )
-                    nxt = arc_states[-1]
-                    if self.collision_checker.collides_path(arc_states):
+                    evaluated = self._evaluate_primitive(current, prim, goal)
+                    if evaluated is None:
                         continue
-                    g_new = current.g + primitive_cost(prim)
-                    if current.action and prim.direction != current.action.direction:
-                        g_new += 0.2  # cusp penalty
+                    nxt, g_new, h_new, order_score = evaluated
+                    candidates.append((nxt, g_new, h_new, order_score, prim))
+                if self.greedy_action_order:
+                    candidates.sort(key=lambda c: c[3])
+                for nxt, g_new, h_new, _, prim in candidates:
                     new_key = self._discretize(nxt)
                     if new_key in visited and visited[new_key] <= g_new:
                         continue
-                    h_new = admissible_heuristic(nxt.as_tuple(), goal.as_tuple(), self.params)
                     node = Node(nxt, g=g_new, h=h_new, parent=current, action=prim)
                     heapq.heappush(open_heap, (self._priority(node), insert_counter, node))
                     insert_counter += 1
