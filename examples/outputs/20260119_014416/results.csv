@@ -1,0 +1,11 @@
+variant,planner,success,path_length,expansions_or_nodes,time,time_wall,failure_reason,remediations,plot_path
+large_map_large_gap,Hybrid A*,True,62.79674074701492,79,0.7239809036254883,0.7239809036254883,,analytic_expansion,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_large_map_large_gap.png
+large_map_large_gap,SS-RRT*,True,60.748827550916225,71,0.8475289344787598,0.8475289344787598,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_large_map_large_gap.png
+large_map_small_gap,Hybrid A*,True,60.422333859937204,77,0.6355326175689697,0.6355326175689697,,analytic_expansion,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_large_map_small_gap.png
+large_map_small_gap,SS-RRT*,False,0.0,196,93.55578184127808,93.55778288841248,timeout,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_large_map_small_gap.png
+small_map_large_gap,Hybrid A*,True,21.718036522616615,25,0.11490392684936523,0.11490392684936523,,analytic_expansion,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_small_map_large_gap.png
+small_map_large_gap,SS-RRT*,True,21.68996440916934,473,0.5231478214263916,0.5231478214263916,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_small_map_large_gap.png
+small_map_small_gap,Hybrid A*,True,23.80738240915357,31,0.1169428825378418,0.1169428825378418,,analytic_expansion,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_small_map_small_gap.png
+small_map_small_gap,SS-RRT*,True,22.420322258972313,61,0.3380565643310547,0.3380565643310547,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_small_map_small_gap.png
+real_env1,Hybrid A*,True,33.23915711368969,25,0.06926584243774414,0.06926584243774414,,analytic_expansion,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_real_env1.png
+real_env1,SS-RRT*,False,0.0,311,8.90780782699585,8.90882658958435,iteration_budget_exhausted,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.9\examples\outputs\20260119_014416\dense_forest_real_env1.png

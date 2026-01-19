@@ -4,7 +4,6 @@ Python scaffold for 2D occupancy-grid path planning with an Ackermann robot mode
 
 ## Planners
 
-- Artificial Potential Field (APF): `pathplan.APFPlanner`
 - Hybrid A*: `pathplan.HybridAStarPlanner`
 - Spline-based RRT* (SS-RRT*): `pathplan.RRTStarPlanner`
 

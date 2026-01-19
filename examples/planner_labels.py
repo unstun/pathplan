@@ -4,29 +4,24 @@ Keep plot legends, CSVs, and prints aligned by importing these names
 instead of hard-coding strings in each script.
 """
 
-APF_NAME = "APF"
 HYBRID_NAME = "Hybrid A*"
 RRT_NAME = "SS-RRT*"
 
 # Stable ordering for legends/exports.
-FORMAL_PLANNER_ORDER = [APF_NAME, HYBRID_NAME, RRT_NAME]
+FORMAL_PLANNER_ORDER = [HYBRID_NAME, RRT_NAME]
 
 PLANNER_COLOR_MAP = {
-    APF_NAME: "#d81b60",  # bold red/magenta
     HYBRID_NAME: "#1f77b4",  # deep blue
     RRT_NAME: "#ff7f0e",  # vivid orange
 }
 
 # Allow mapping from class names or legacy labels to the formal label.
 CLASS_NAME_TO_LABEL = {
-    "APFPlanner": APF_NAME,
     "HybridAStarPlanner": HYBRID_NAME,
     "RRTStarPlanner": RRT_NAME,
 }
 
 LEGACY_LABEL_TO_FORMAL = {
-    "Artificial Potential Field": APF_NAME,
-    "APF": APF_NAME,
     "Hybrid A*": HYBRID_NAME,
     "Hybrid A* Lattice Search": HYBRID_NAME,
     "SS-RRT*": RRT_NAME,

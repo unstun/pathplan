@@ -2,7 +2,7 @@
 Dense forest scenario with many tree obstacles (flat terrain, no slopes).
 Five presets are available: the four synthetic variants (large/small maps with large/small gaps)
 plus the real_env1 map built from the real SLAM occupancy grid.
-Run one command to generate every preset and planner (APF, Hybrid A*, SS-RRT*):
+Run one command to generate every preset and planner (Hybrid A*, SS-RRT*):
     python -m examples.forest_scene --variant all
 Outputs (plots + CSV) are written to time-stamped folders in examples/outputs/.
 """
@@ -32,14 +32,12 @@ from pathplan import (
     OrientedBoxFootprint,
     TwoCircleFootprint,
     RRTStarPlanner,
-    APFPlanner,
 )
 from pathplan.geometry import GridFootprintChecker
 from pathplan.common import default_collision_step
 from pathplan.primitives import default_primitives
 
 from examples.planner_labels import (
-    APF_NAME,
     HYBRID_NAME,
     PLANNER_COLOR_MAP,
     RRT_NAME,
@@ -133,8 +131,7 @@ PRIMARY_LINEWIDTH = 3.6
 
 def strip_variant_suffix(label: str) -> str:
     """
-    Remove variant suffixes like '(orig)' while keeping formal names
-    that may themselves contain parentheses (e.g., '(APF)').
+    Remove variant suffixes like '(orig)'.
     """
     if " (" in label and label.endswith(")"):
         suffix = label[label.rfind("(") + 1 : -1].strip().lower()
@@ -164,7 +161,6 @@ def normalize_planner_label(label: str) -> str:
         "rrt": RRT_NAME,
         "rrt*": RRT_NAME,
         "informedrrt*": RRT_NAME,
-        "apf": APF_NAME,
         "hybrid": HYBRID_NAME,
         "hybrida*": HYBRID_NAME,
     }
@@ -583,8 +579,6 @@ def adaptive_goal_tolerances(
 DEFAULT_START, DEFAULT_GOAL = compute_start_goal(FOREST_MAP_KWARGS)
 
 # Planner budgets tuned for sub-second runs.
-APF_TIMEOUT = 5.0
-APF_MAX_ITERS = 12_000
 HYBRID_TIMEOUT = 5.0
 HYBRID_MAX_NODES = 8_000
 RRT_TIMEOUT = 10.0
@@ -897,7 +891,6 @@ def plan_forest_scene(
     else:
         footprint = OrientedBoxFootprint(length=footprint_length, width=footprint_width)
     base_collision_step = default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25)
-    apf_collision_step = default_collision_step(grid_map.resolution, preferred=0.10, max_step=0.18)
     lattice_xy_res = 0.60
     goal_xy_tol, goal_theta_tol = adaptive_goal_tolerances(
         grid_map, is_large_map, base_collision_step, lattice_xy_res
@@ -951,20 +944,6 @@ def plan_forest_scene(
     )
     rrt_timeout = RRT_TIMEOUT
     rrt_max_iter = RRT_MAX_ITER
-    apf_kwargs = dict(
-        step_size=0.22,
-        goal_tol=max(goal_xy_tol, 0.25 if is_large_map else 0.18),
-        repulse_radius=1.1,
-        obstacle_gain=1.0,
-        goal_gain=1.2,
-        max_iters=APF_MAX_ITERS,
-        collision_step=apf_collision_step,
-        stall_steps=80,
-        theta_bins=64,
-        min_step=0.05,
-        jitter_angle=0.6,
-        heading_rate=0.65,
-    )
     # Variants can override RRT tuning; the sparse small-map-with-gap benefits from longer strides + looser heading.
     if not is_large_map and variant_slug == "small_map_large_gap":
         rrt_kwargs.update(
@@ -995,26 +974,7 @@ def plan_forest_scene(
         rrt_timeout = max(rrt_timeout, 18.0)
         rrt_max_iter = max(rrt_max_iter, 60_000)
 
-    # Slightly loosen APF heading dynamics on the hardest scene to preserve success while smoothing later.
-    apf_kwargs_variant = dict(apf_kwargs)
-    if variant_slug == "large_map_small_gap":
-        apf_kwargs_variant.update(dict(jitter_angle=0.8, heading_rate=0.72))
-    if variant_slug == "real_env1":
-        apf_kwargs_variant.update(
-            dict(
-                step_size=0.24,
-                repulse_radius=0.95,
-                obstacle_gain=0.85,
-                goal_gain=1.35,
-                heading_rate=0.70,
-                jitter_angle=0.5,
-                stall_steps=90,
-                min_step=0.06,
-            )
-        )
-
     planners = [
-        (APF_NAME, APFPlanner(grid_map, footprint, params, **apf_kwargs_variant)),
         (HYBRID_NAME, HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **hybrid_kwargs)),
         (RRT_NAME, RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
     ]
@@ -1047,8 +1007,6 @@ def plan_forest_scene(
             path, stats = planner.plan(start, goal, max_iter=rrt_max_iter, timeout=rrt_timeout)
         elif isinstance(planner, HybridAStarPlanner):
             path, stats = planner.plan(start, goal, timeout=HYBRID_TIMEOUT, max_nodes=HYBRID_MAX_NODES)
-        elif isinstance(planner, APFPlanner):
-            path, stats = planner.plan(start, goal, timeout=APF_TIMEOUT)
         else:
             path, stats = planner.plan(start, goal)
         stats["time_wall"] = time.time() - t0
