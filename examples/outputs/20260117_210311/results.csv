@@ -1,0 +1,4 @@
+variant,planner,success,path_length,expansions_or_nodes,time,time_wall,failure_reason,remediations,plot_path
+small_map_small_gap,APF,True,33.932345715857416,166,0.04728269577026367,0.04731297492980957,,escape_step;escape_step;escape_step;escape_step;escape_step;escape_step;escape_step;escape_step;escape_step;escape_step;escape_step,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_210311\dense_forest_small_map_small_gap.png
+small_map_small_gap,Hybrid A*,True,30.872614992002482,301,0.12597966194152832,0.126326322555542,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_210311\dense_forest_small_map_small_gap.png
+small_map_small_gap,Informed RRT*,False,0.0,5732,10.009432792663574,10.010005474090576,timeout,explore_step;short_step_retry,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_210311\dense_forest_small_map_small_gap.png

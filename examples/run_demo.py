@@ -12,11 +12,10 @@ from pathplan import (
     HybridAStarPlanner,
     OrientedBoxFootprint,
     RRTStarPlanner,
-    DQNHybridAStarPlanner,
     APFPlanner,
 )
 
-from examples.planner_labels import APF_NAME, DQNHYBRID_NAME, HYBRID_NAME, RRT_NAME
+from examples.planner_labels import APF_NAME, HYBRID_NAME, RRT_NAME
 
 try:
     import matplotlib.pyplot as plt
@@ -119,7 +118,6 @@ def run_scenario(
     planners = [
         (APF_NAME, APFPlanner(grid_map, footprint, params)),
         (HYBRID_NAME, HybridAStarPlanner(grid_map, footprint, params)),
-        (DQNHYBRID_NAME, DQNHybridAStarPlanner(grid_map, footprint, params)),
         (RRT_NAME, RRTStarPlanner(grid_map, footprint, params)),
     ]
 

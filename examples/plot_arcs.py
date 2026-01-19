@@ -3,7 +3,7 @@ Quick-start visualization for curved Hybrid A* lattice trajectories.
 
 What it does:
 - Builds a tiny empty map.
-- Runs Hybrid A* (and optionally the D-Hybrid A* / DQN-guided variant if you flip a flag).
+- Runs Hybrid A* and SS-RRT*.
 - Plots the arc samples and per-step vehicle rectangles using the stats
   fields exposed by the planners (`trace_poses`, `trace_boxes`).
 
@@ -26,7 +26,6 @@ from pathplan import (
     HybridAStarPlanner,
     OrientedBoxFootprint,
     RRTStarPlanner,
-    DQNHybridAStarPlanner,
 )
 
 from examples.planner_labels import formal_planner_name
@@ -113,7 +112,7 @@ def plot(grid_map: GridMap, start: AckermannState, goal: AckermannState, path, s
 
 
 def main():
-    planners = [HybridAStarPlanner, DQNHybridAStarPlanner, RRTStarPlanner]
+    planners = [HybridAStarPlanner, RRTStarPlanner]
     for planner_cls in planners:
         grid_map, start, goal, footprint, path, stats, label = plan_once(planner_cls)
         title = f"{label} arc trace"

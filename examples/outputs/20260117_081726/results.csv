@@ -1,0 +1,16 @@
+variant,planner,success,path_length,expansions_or_nodes,time,time_wall,failure_reason,remediations,plot_path
+large_map_large_gap,APF,True,67.89755792863042,308,0.38326191902160645,0.38326191902160645,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_large_map_large_gap.png
+large_map_large_gap,Hybrid A*,True,84.85937850109016,472,0.4265766143798828,0.42759227752685547,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_large_map_large_gap.png
+large_map_large_gap,Informed RRT*,True,78.17576861955521,1278,2.809924840927124,2.811429977416992,,explore_step;short_step_retry,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_large_map_large_gap.png
+large_map_small_gap,APF,True,70.76333574858505,321,0.3076598644256592,0.3076598644256592,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_large_map_small_gap.png
+large_map_small_gap,Hybrid A*,True,87.24687273815432,697,0.5739843845367432,0.5775115489959717,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_large_map_small_gap.png
+large_map_small_gap,Informed RRT*,True,66.11427082923802,737,1.0962355136871338,1.0962355136871338,,short_step_retry;explore_step,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_large_map_small_gap.png
+small_map_large_gap,APF,True,22.05530140621846,100,0.05404257774353027,0.05404257774353027,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_small_map_large_gap.png
+small_map_large_gap,Hybrid A*,True,31.48299037293157,444,0.3572986125946045,0.3594193458557129,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_small_map_large_gap.png
+small_map_large_gap,Informed RRT*,True,33.90125254179258,327,0.127457857131958,0.127457857131958,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_small_map_large_gap.png
+small_map_small_gap,APF,True,25.201660751039398,114,0.05558633804321289,0.056606292724609375,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_small_map_small_gap.png
+small_map_small_gap,Hybrid A*,True,33.00811273188648,389,0.32027769088745117,0.3212900161743164,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_small_map_small_gap.png
+small_map_small_gap,Informed RRT*,True,29.39325064494435,1171,1.4711418151855469,1.4711418151855469,,explore_step;short_step_retry,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_small_map_small_gap.png
+real_env1,APF,True,34.02578266458794,141,0.03525352478027344,0.03525352478027344,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_real_env1.png
+real_env1,Hybrid A*,True,33.56809688600826,134,0.10448360443115234,0.10448360443115234,,,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_real_env1.png
+real_env1,Informed RRT*,True,36.61753188788763,290,0.3127598762512207,0.3127598762512207,,explore_step;short_step_retry,D:\BaiduSyncdisk\study\phdprojec\pathplan_1.8\examples\outputs\20260117_081726\dense_forest_real_env1.png

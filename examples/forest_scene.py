@@ -2,7 +2,7 @@
 Dense forest scenario with many tree obstacles (flat terrain, no slopes).
 Five presets are available: the four synthetic variants (large/small maps with large/small gaps)
 plus the real_env1 map built from the real SLAM occupancy grid.
-Run one command to generate every preset and planner (APF, Hybrid A*, D-Hybrid A*, Informed RRT*):
+Run one command to generate every preset and planner (APF, Hybrid A*, SS-RRT*):
     python -m examples.forest_scene --variant all
 Outputs (plots + CSV) are written to time-stamped folders in examples/outputs/.
 """
@@ -17,7 +17,7 @@ import sys
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set, Tuple
+from typing import List, Optional, Tuple, Union
 
 # Allow duplicated Intel OpenMP runtimes (NumPy + other libs) to coexist for this script.
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -30,11 +30,9 @@ from pathplan import (
     GridMap,
     HybridAStarPlanner,
     OrientedBoxFootprint,
-    DQNHybridAStarPlanner,
+    TwoCircleFootprint,
     RRTStarPlanner,
     APFPlanner,
-    feng_optimize_path,
-    stomp_optimize_path,
 )
 from pathplan.geometry import GridFootprintChecker
 from pathplan.common import default_collision_step
@@ -42,7 +40,6 @@ from pathplan.primitives import default_primitives
 
 from examples.planner_labels import (
     APF_NAME,
-    DQNHYBRID_NAME,
     HYBRID_NAME,
     PLANNER_COLOR_MAP,
     RRT_NAME,
@@ -59,7 +56,7 @@ FOREST_MAP_KWARGS = dict(
     resolution=0.1,
     size=(40.0, 28.0),
     num_trees=400,  # dense but still navigable
-    tree_radius=0.30,
+    tree_radius=0.2,
     clearance=1.8,
     seed=13,
     keep_clear=None,  # filled dynamically based on the map size
@@ -136,16 +133,15 @@ PRIMARY_LINEWIDTH = 3.6
 
 def strip_variant_suffix(label: str) -> str:
     """
-    Remove variant suffixes like '(orig)' or '(stomp)' while keeping formal names
+    Remove variant suffixes like '(orig)' while keeping formal names
     that may themselves contain parentheses (e.g., '(APF)').
     """
     if " (" in label and label.endswith(")"):
         suffix = label[label.rfind("(") + 1 : -1].strip().lower()
-        # Handle combined tags such as 'feng+stomp' by splitting on common separators.
         for sep in ("+", "/", "|", "&"):
             suffix = suffix.replace(sep, " ")
         suffix_tokens = {tok.strip() for tok in suffix.split() if tok.strip()}
-        if suffix_tokens.intersection({"orig", "stomp", "feng"}):
+        if suffix_tokens.intersection({"orig"}):
             return label[: label.rfind(" (")].strip()
     return label
 
@@ -171,30 +167,8 @@ def normalize_planner_label(label: str) -> str:
         "apf": APF_NAME,
         "hybrid": HYBRID_NAME,
         "hybrida*": HYBRID_NAME,
-        "dhybrid": DQNHYBRID_NAME,
-        "d-hybrid": DQNHYBRID_NAME,
-        "dhybrida*": DQNHYBRID_NAME,
-        "d-hybrida*": DQNHYBRID_NAME,
     }
     return aliases.get(slug, text)
-
-
-def parse_postprocess_allow(arg: Optional[str]) -> Optional[Set[str]]:
-    """
-    Parse a comma-separated allowlist of planners for postprocessing.
-    Returns None when all planners are allowed.
-    """
-    if arg is None:
-        return None
-    text = str(arg).strip()
-    if not text or text.lower() in ("all", "any", "*"):
-        return None
-    allowed: Set[str] = set()
-    for part in text.split(","):
-        name = normalize_planner_label(part)
-        if name:
-            allowed.add(strip_variant_suffix(name))
-    return allowed or None
 
 
 def path_length(path: List[AckermannState]) -> float:
@@ -204,94 +178,6 @@ def path_length(path: List[AckermannState]) -> float:
         dy = path[i].y - path[i - 1].y
         length += math.hypot(dx, dy)
     return length
-
-
-def max_xy_deviation(a: List[AckermannState], b: List[AckermannState], samples: int = 80) -> float:
-    """
-    Measure the maximum XY drift between two paths after resampling them
-    to the same parametric positions. Useful for detecting when an optimizer
-    effectively returned the input trajectory (even with different sampling).
-    """
-    if not a or not b:
-        return float("inf")
-    samples = max(2, int(samples))
-    taus = np.linspace(0.0, 1.0, samples)
-
-    def sample(path: List[AckermannState]) -> np.ndarray:
-        if len(path) == 1:
-            return np.tile([[path[0].x, path[0].y]], (samples, 1))
-        pts = np.zeros((samples, 2), dtype=float)
-        last_idx = len(path) - 1
-        for i, tau in enumerate(taus):
-            s = tau * last_idx
-            i0 = int(math.floor(s))
-            i1 = min(i0 + 1, last_idx)
-            t = s - i0
-            p0 = path[i0]
-            p1 = path[i1]
-            pts[i, 0] = p0.x + (p1.x - p0.x) * t
-            pts[i, 1] = p0.y + (p1.y - p0.y) * t
-        return pts
-
-    pts_a = sample(a)
-    pts_b = sample(b)
-    return float(np.linalg.norm(pts_a - pts_b, axis=1).max())
-
-
-def reorient_path_headings(path: List[AckermannState]) -> List[AckermannState]:
-    """
-    Align headings to the forward segment direction to avoid arc reconstruction
-    cutting corners during postprocessing.
-    """
-    if not path:
-        return []
-    aligned: List[AckermannState] = []
-    for i, pose in enumerate(path):
-        if i + 1 < len(path):
-            nxt = path[i + 1]
-            heading = math.atan2(nxt.y - pose.y, nxt.x - pose.x)
-        elif aligned:
-            heading = aligned[-1].theta
-        else:
-            heading = pose.theta
-        aligned.append(AckermannState(pose.x, pose.y, heading))
-    return aligned
-
-
-def laplacian_smooth_path(
-    path: List[AckermannState],
-    checker: GridFootprintChecker,
-    ds_check: float,
-    *,
-    alpha: float = 0.18,
-    passes: int = 4,
-) -> Tuple[List[AckermannState], bool]:
-    """
-    Lightweight Laplacian smoothing on XY positions with collision checks.
-    Keeps endpoints fixed and re-computes headings from neighboring points.
-    """
-    if len(path) < 3 or alpha <= 0.0 or passes <= 0:
-        return list(path), False
-    smoothed = list(path)
-    for _ in range(passes):
-        updated: List[AckermannState] = [smoothed[0]]
-        for i in range(1, len(smoothed) - 1):
-            prev_p = smoothed[i - 1]
-            curr = smoothed[i]
-            nxt = smoothed[i + 1]
-            x = curr.x + alpha * ((prev_p.x + nxt.x) - 2.0 * curr.x)
-            y = curr.y + alpha * ((prev_p.y + nxt.y) - 2.0 * curr.y)
-            heading = math.atan2(nxt.y - prev_p.y, nxt.x - prev_p.x)
-            updated.append(AckermannState(x, y, heading))
-        last = smoothed[-1]
-        updated.append(AckermannState(last.x, last.y, last.theta))
-        smoothed = updated
-    if checker.collides_path(smoothed):
-        return list(path), False
-    for a, b in zip(smoothed[:-1], smoothed[1:]):
-        if checker.motion_collides(a.as_tuple(), b.as_tuple(), step=ds_check):
-            return list(path), False
-    return smoothed, True
 
 
 def compute_start_goal(map_kwargs):
@@ -394,6 +280,7 @@ def load_real_env1_map(
     cfg,
     start_override: Optional[Tuple[float, float, Optional[float]]] = None,
     goal_override: Optional[Tuple[float, float, Optional[float]]] = None,
+    footprint_model: str = "box",
 ) -> Tuple[GridMap, AckermannState, AckermannState, dict]:
     """
     Load the real_env1 occupancy grid + YAML, choose distant start/goal inside the
@@ -422,8 +309,12 @@ def load_real_env1_map(
     footprint_width = float(cfg.get("footprint_width", 0.740))
     clearance_margin = cfg.get("start_goal_clearance", None)
     if clearance_margin is None:
-        # Use the circumscribed radius of the robot footprint plus half a cell to guarantee clearance.
-        clearance_margin = math.hypot(footprint_length * 0.5, footprint_width * 0.5) + max(resolution * 0.5, 0.05)
+        # Use a circumscribed radius based on the chosen footprint model plus half a cell to guarantee clearance.
+        base_clearance = math.hypot(footprint_length * 0.5, footprint_width * 0.5)
+        if footprint_model == "two_circle":
+            circles = TwoCircleFootprint.from_box(footprint_length, footprint_width)
+            base_clearance = circles.center_offset + circles.radius
+        clearance_margin = base_clearance + max(resolution * 0.5, 0.05)
 
     def apply_boundary_clearance(mask: np.ndarray, boundary_clearance: float) -> np.ndarray:
         """
@@ -463,7 +354,10 @@ def load_real_env1_map(
     endpoint_mask = apply_boundary_clearance(endpoint_mask, boundary_clearance)
     clear_free_cells = int(np.count_nonzero(safe_mask))
 
-    footprint = OrientedBoxFootprint(footprint_length, footprint_width)
+    if footprint_model == "two_circle":
+        footprint = TwoCircleFootprint.from_box(footprint_length, footprint_width)
+    else:
+        footprint = OrientedBoxFootprint(footprint_length, footprint_width)
     pose_checker = GridFootprintChecker(grid_map, footprint, theta_bins=72)
     pose_checker_coarse = GridFootprintChecker(grid_map, footprint, theta_bins=48)
 
@@ -693,8 +587,6 @@ APF_TIMEOUT = 5.0
 APF_MAX_ITERS = 12_000
 HYBRID_TIMEOUT = 5.0
 HYBRID_MAX_NODES = 8_000
-DQN_TIMEOUT = 5.0
-DQN_MAX_NODES = 8_000
 RRT_TIMEOUT = 10.0
 RRT_MAX_ITER = 30_000
 
@@ -836,7 +728,7 @@ def plot_with_boxes(
     start: AckermannState,
     goal: AckermannState,
     planner_results: List[Tuple[str, List[AckermannState], dict]],
-    footprint: OrientedBoxFootprint,
+    footprint: Union[OrientedBoxFootprint, TwoCircleFootprint],
     out_dir: Path,
     legend_labels: Optional[List[str]] = None,
 ):
@@ -941,13 +833,19 @@ def build_variant(
     variant: str,
     start_override: Optional[Tuple[float, float, Optional[float]]] = None,
     goal_override: Optional[Tuple[float, float, Optional[float]]] = None,
+    footprint_model: str = "box",
 ):
     variant_slug = normalize_variant(variant)
     cfg = FOREST_VARIANTS[variant_slug]
     title = cfg.get("title", f"Forest ({variant_slug})")
 
     if cfg.get("loader") == "real_env1":
-        grid_map, start, goal, meta = load_real_env1_map(cfg, start_override=start_override, goal_override=goal_override)
+        grid_map, start, goal, meta = load_real_env1_map(
+            cfg,
+            start_override=start_override,
+            goal_override=goal_override,
+            footprint_model=footprint_model,
+        )
         map_kwargs = {
             "size": meta["size"],
             "resolution": meta["resolution"],
@@ -973,18 +871,18 @@ def build_variant(
 def plan_forest_scene(
     variant: str = "large_map_small_gap",
     out_dir: Optional[Path] = None,
-    postprocess: str = "none",
-    postprocess_allow: Optional[Set[str]] = None,
     start_override: Optional[Tuple[float, float, Optional[float]]] = None,
     goal_override: Optional[Tuple[float, float, Optional[float]]] = None,
     legend_style: str = "standard",
+    footprint_model: str = "box",
 ):
     output_dir = out_dir or (Path(__file__).resolve().parent / "outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
-    post_mode = (postprocess or "none").strip().lower()
-    postprocess_allow = {strip_variant_suffix(p) for p in postprocess_allow} if postprocess_allow else None
     variant_slug, title, map_kwargs, start, goal, grid_map_override = build_variant(
-        variant, start_override=start_override, goal_override=goal_override
+        variant,
+        start_override=start_override,
+        goal_override=goal_override,
+        footprint_model=footprint_model,
     )
     grid_map = grid_map_override or make_forest_map(**map_kwargs)
     size_x, size_y = map_kwargs.get(
@@ -992,7 +890,12 @@ def plan_forest_scene(
     )
     is_large_map = max(size_x, size_y) > 30.0
     params = AckermannParams()
-    footprint = OrientedBoxFootprint(length=0.924, width=0.740)
+    footprint_length = 0.924
+    footprint_width = 0.740
+    if footprint_model == "two_circle":
+        footprint = TwoCircleFootprint.from_box(footprint_length, footprint_width)
+    else:
+        footprint = OrientedBoxFootprint(length=footprint_length, width=footprint_width)
     base_collision_step = default_collision_step(grid_map.resolution, preferred=0.15, max_step=0.25)
     apf_collision_step = default_collision_step(grid_map.resolution, preferred=0.10, max_step=0.18)
     lattice_xy_res = 0.60
@@ -1004,6 +907,7 @@ def plan_forest_scene(
         f"Variant '{variant_slug}': size=({size_x:.2f}, {size_y:.2f}) m, "
         f"trees/obstacles={map_kwargs.get('num_trees', 'n/a')}, resolution={map_kwargs.get('resolution', grid_map.resolution):.2f} m"
     )
+    print(f"  Footprint model: {footprint_model}")
     if map_kwargs.get("free_cells") is not None:
         print(
             f"  Cells: free={map_kwargs['free_cells']:,}, "
@@ -1030,9 +934,9 @@ def plan_forest_scene(
         goal_theta_tol=goal_theta_tol,
         theta_bins=48,
     )
+
     # Stronger heuristic to offset the tighter turning radius (28° steer) speeding up search on large maps.
     hybrid_kwargs = dict(base_kwargs, heuristic_weight=2.5)
-    dqn_kwargs = dict(base_kwargs, dqn_top_k=3, anchor_inflation=1.6, dqn_weight=1.1)
     rrt_kwargs = dict(
         goal_sample_rate=0.90,  # stronger bias helps when heading penalties tighten with higher steering limits
         neighbor_radius=5.0 if is_large_map else 2.8,
@@ -1109,11 +1013,9 @@ def plan_forest_scene(
             )
         )
 
-    post_checker = GridFootprintChecker(grid_map, footprint, theta_bins=72)
     planners = [
         (APF_NAME, APFPlanner(grid_map, footprint, params, **apf_kwargs_variant)),
         (HYBRID_NAME, HybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **hybrid_kwargs)),
-        (DQNHYBRID_NAME, DQNHybridAStarPlanner(grid_map, footprint, params, primitives=short_primitives, **dqn_kwargs)),
         (RRT_NAME, RRTStarPlanner(grid_map, footprint, params, **rrt_kwargs)),
     ]
 
@@ -1121,24 +1023,12 @@ def plan_forest_scene(
     planner_results = []
     path_export_rows = []
 
-    def paths_match(a: List[AckermannState], b: List[AckermannState], pos_tol: float = 1e-3, theta_tol: float = 1e-3) -> bool:
-        """Check if two paths are effectively identical."""
-        if len(a) != len(b):
-            return False
-        for pa, pb in zip(a, b):
-            if math.hypot(pa.x - pb.x, pa.y - pb.y) > pos_tol:
-                return False
-            dtheta = abs((pa.theta - pb.theta + math.pi) % (2 * math.pi) - math.pi)
-            if dtheta > theta_tol:
-                return False
-        return True
-
     def add_path_rows(label: str, path_seq: List[AckermannState]):
         if not path_seq:
             return
         base_label = strip_variant_suffix(label)
         lower_label = label.lower()
-        kind = "stomp" if "stomp" in lower_label else ("orig" if "orig" in lower_label else "final")
+        kind = "orig" if "orig" in lower_label else "final"
         for idx, pose in enumerate(path_seq):
             path_export_rows.append(
                 {
@@ -1152,13 +1042,9 @@ def plan_forest_scene(
                 }
             )
     for label, planner in planners:
-        base_label = strip_variant_suffix(label)
-        allow_postprocess = postprocess_allow is None or base_label in postprocess_allow
         t0 = time.time()
         if isinstance(planner, RRTStarPlanner):
             path, stats = planner.plan(start, goal, max_iter=rrt_max_iter, timeout=rrt_timeout)
-        elif isinstance(planner, DQNHybridAStarPlanner):
-            path, stats = planner.plan(start, goal, timeout=DQN_TIMEOUT, max_nodes=DQN_MAX_NODES)
         elif isinstance(planner, HybridAStarPlanner):
             path, stats = planner.plan(start, goal, timeout=HYBRID_TIMEOUT, max_nodes=HYBRID_MAX_NODES)
         elif isinstance(planner, APFPlanner):
@@ -1170,165 +1056,12 @@ def plan_forest_scene(
         expansions = stats.get("expansions", stats.get("expansions_total", stats.get("nodes", "-")))
         raw_path = list(path)
         path_len = path_length(raw_path)
-        plot_entries = []
-        if success and post_mode in ("stomp", "feng") and allow_postprocess:
-            plot_entries.append((f"{label} (orig)", raw_path, dict(stats)))
-            opt_t0 = time.time()
-            post_input_path = reorient_path_headings(raw_path)
-            if label == APF_NAME:
-                # Pre-smooth APF headings/positions to reduce zig-zags before optimization.
-                pre_smooth_path, ok_pre = laplacian_smooth_path(
-                    post_input_path,
-                    post_checker,
-                    ds_check=apf_collision_step,
-                    alpha=0.14,
-                    passes=3,
-                )
-                if ok_pre:
-                    post_input_path = pre_smooth_path
-            opt_path = []
-            opt_info = {}
-            suffix = post_mode
-            if post_mode == "stomp":
-                opt_path, opt_info = stomp_optimize_path(
-                    post_input_path,
-                    grid_map,
-                    footprint,
-                    params,
-                    step_size=0.25,
-                    ds_check=base_collision_step,
-                    rollouts=96,
-                    iters=50,
-                    lambda_=0.6,
-                    w_clear=0.6,
-                    w_goal=2.5,
-                    w_prior=0.1,
-                    w_track=0.05,
-                    allow_reverse=True,
-                    seed=13,
-                    goal=goal,
-                    laplacian_strength=0.4,
-                )
-                suffix = "stomp"
-                if not opt_path:
-                    opt_path = post_input_path
-                    opt_info = opt_info or {}
-                    opt_info.setdefault("reason", "fallback_to_orig_path")
-                    opt_info.setdefault("improved", False)
-                    opt_info.setdefault("best_cost", opt_info.get("base_cost", float("inf")))
-            else:
-                opt_path, opt_info = feng_optimize_path(
-                    post_input_path,
-                    grid_map,
-                    footprint,
-                    params,
-                    goal=goal,
-                    degree=5,
-                    max_segments=10,
-                    samples_per_seg=14,
-                    rect_size=2.8,
-                    safety_margin=0.2,
-                    output_step=0.22,
-                    ds_check=base_collision_step,
-                    iters=55,
-                    lr=0.1,
-                    w_terrain=1.4,
-                    w_safety=28.0,
-                    w_dyn=5.0,
-                    w_cont=6.0,
-                    w_track=0.12,
-                    seed=7,
-                )
-                suffix = "feng"
-                max_dev = max_xy_deviation(raw_path, opt_path, samples=96) if opt_path else float("inf")
-                no_change_tol = max(grid_map.resolution * 1.2, 0.08)
-                opt_info["max_deviation"] = max_dev
-                opt_info["no_change_tol"] = no_change_tol
-                no_change = math.isfinite(max_dev) and max_dev <= no_change_tol
-                # If Feng returns empty/unchanged, retry Feng with a heavier second pass (same method, different seed).
-                retry_needed = (
-                    not opt_path
-                    or opt_info.get("reason") == "fallback_to_input"
-                    or paths_match(opt_path, post_input_path)
-                    or no_change
-                )
-                if retry_needed:
-                    second_path, second_info = feng_optimize_path(
-                        post_input_path,
-                        grid_map,
-                        footprint,
-                        params,
-                        goal=goal,
-                        degree=5,
-                        max_segments=12,
-                        samples_per_seg=16,
-                        rect_size=3.0,
-                        safety_margin=0.22,
-                        output_step=0.22,
-                        ds_check=base_collision_step,
-                        iters=80,
-                        lr=0.09,
-                        w_terrain=1.4,
-                        w_safety=28.0,
-                        w_dyn=5.0,
-                        w_cont=6.0,
-                        w_track=0.10,
-                        seed=19,
-                    )
-                    opt_info["second_pass"] = second_info
-                    if second_path:
-                        opt_path = second_path
-                        opt_info["reason"] = second_info.get("reason", "feng_second_pass")
-                        opt_info["best_cost"] = second_info.get("best_cost", opt_info.get("best_cost"))
-                        opt_info["improved"] = second_info.get("improved", opt_info.get("improved"))
-                        opt_info["iters_run"] = second_info.get("iters_run", opt_info.get("iters_run"))
-                        opt_info["selected_pass"] = "second"
-                        max_dev = max_xy_deviation(raw_path, opt_path, samples=96)
-                        opt_info["max_deviation"] = max_dev
-                    else:
-                        opt_info.setdefault("reason", "feng_no_change")
-            if not opt_path:
-                opt_path = post_input_path
-                opt_info = opt_info or {}
-                opt_info.setdefault("reason", "fallback_to_orig_path")
-                opt_info.setdefault("improved", False)
-                opt_info.setdefault("best_cost", opt_info.get("base_cost", float("inf")))
-            # Secondary smoothing when postprocessing could not change the geometry (APF often hugs obstacles).
-            post_max_dev = max_xy_deviation(raw_path, opt_path, samples=120) if opt_path else float("inf")
-            smooth_tol = max(grid_map.resolution * 0.8, 0.06)
-            if not opt_path or post_max_dev <= smooth_tol:
-                smooth_step = min(base_collision_step, apf_collision_step)
-                smooth_alpha = 0.22 if label == APF_NAME else 0.14
-                smoothed_path, smoothed = laplacian_smooth_path(
-                    opt_path or post_input_path,
-                    post_checker,
-                    ds_check=smooth_step,
-                    alpha=smooth_alpha,
-                    passes=5 if label == APF_NAME else 3,
-                )
-                if smoothed:
-                    smooth_dev = max_xy_deviation(raw_path, smoothed_path, samples=120)
-                    if smooth_dev > post_max_dev + 1e-6:
-                        opt_info.setdefault("fallback", {})["mode"] = "laplacian"
-                        opt_info["reason"] = opt_info.get("reason", "postprocess_no_change")
-                        opt_info["base_max_deviation"] = post_max_dev
-                        opt_info["max_deviation"] = smooth_dev
-                        opt_path = smoothed_path
-                        suffix = f"{suffix}+smooth"
-                        post_max_dev = smooth_dev
-            stats["postprocess"] = opt_info
-            stats["postprocess_time"] = time.time() - opt_t0
-            path_len = path_length(opt_path)
-            plot_entries.append((f"{label} ({suffix})", opt_path, dict(stats)))
-            # Keep the optimized curve (including STOMP fallbacks) in exports/plots.
-            path = opt_path
         print(
             f"{label}: success={success}, time={stats.get('time',0):.2f}s, "
             f"path_len={path_len:.2f}, expansions/nodes={expansions}"
         )
         failure_reason = stats.get("failure_reason", "")
         remediations = stats.get("remediations", [])
-        post_info = stats.get("postprocess", {}) if isinstance(stats.get("postprocess"), dict) else {}
         if not success and failure_reason:
             remediation_str = ";".join(remediations) if remediations else "none"
             print(f"  failure_reason={failure_reason}, remediations={remediation_str}")
@@ -1343,21 +1076,11 @@ def plan_forest_scene(
                 "time_wall": stats.get("time_wall", 0.0),
                 "failure_reason": failure_reason,
                 "remediations": ";".join(remediations) if remediations else "",
-                "postprocess_mode": post_mode if post_mode in ("stomp", "feng") else "none",
-                "postprocess_reason": post_info.get("reason", ""),
-                "postprocess_improved": post_info.get("improved", ""),
-                "postprocess_selected_cost": post_info.get("selected_cost", ""),
-                "postprocess_time": stats.get("postprocess_time", 0.0),
             }
         )
         if success:
-            if plot_entries:
-                planner_results.extend(plot_entries)
-                for lbl, pth, _ in plot_entries:
-                    add_path_rows(lbl, pth)
-            else:
-                planner_results.append((label, path, stats))
-                add_path_rows(label, path)
+            planner_results.append((label, path, stats))
+            add_path_rows(label, path)
 
     legend_labels = None
     if legend_style == "ambiguous" and planner_results:
@@ -1393,8 +1116,6 @@ def plan_forest_scene(
         size_x=size_x,
         size_y=size_y,
         num_trees=map_kwargs.get("num_trees", ""),
-        postprocess=post_mode if post_mode in ("stomp", "feng") else "none",
-        postprocess_allow=",".join(sorted(postprocess_allow)) if postprocess_allow else "all",
         legend_style=legend_style or "standard",
     )
 
@@ -1428,17 +1149,6 @@ def parse_args():
         help="Base folder for results. A time-stamped subfolder is created inside.",
     )
     parser.add_argument(
-        "--postprocess",
-        choices=["none", "stomp", "feng"],
-        default="none",
-        help="Apply a trajectory postprocessor after planning (default: none).",
-    )
-    parser.add_argument(
-        "--postprocess-allow",
-        default="all",
-        help="Comma-separated planners to postprocess (e.g., 'APF,RRT'). Use 'all' to keep the default behavior.",
-    )
-    parser.add_argument(
         "--legend-style",
         choices=["standard", "ambiguous"],
         default="standard",
@@ -1454,6 +1164,12 @@ def parse_args():
         type=lambda s: parse_pose_arg(s, "goal"),
         help="Manual goal pose 'x,y[,theta]' in meters/radians (real_env1 only).",
     )
+    parser.add_argument(
+        "--footprint-model",
+        choices=["box", "two_circle"],
+        default="box",
+        help="Robot collision footprint model. Use 'box' for an oriented rectangle or 'two_circle' for a two-circle approximation.",
+    )
     return parser.parse_args()
 
 
@@ -1467,18 +1183,16 @@ if __name__ == "__main__":
     all_records = []
     all_run_info = []
     all_path_rows = []
-    postprocess_allow = parse_postprocess_allow(args.postprocess_allow)
     variants = list(FOREST_VARIANTS) if args.variant.strip().lower() in ("all", "any") else [args.variant]
     for variant_name in variants:
         print("\n" + "=" * 60)
         records, _, run_info, path_rows = plan_forest_scene(
             variant_name,
             out_dir=out_dir,
-            postprocess=args.postprocess,
-            postprocess_allow=postprocess_allow,
             start_override=args.start,
             goal_override=args.goal,
             legend_style=args.legend_style,
+            footprint_model=args.footprint_model,
         )
         all_records.extend(records)
         all_run_info.append(run_info)
@@ -1496,11 +1210,6 @@ if __name__ == "__main__":
             "time_wall",
             "failure_reason",
             "remediations",
-            "postprocess_mode",
-            "postprocess_reason",
-            "postprocess_improved",
-            "postprocess_selected_cost",
-            "postprocess_time",
             "plot_path",
         ]
         with csv_path.open("w", newline="") as f:
@@ -1533,8 +1242,6 @@ if __name__ == "__main__":
             "size_x",
             "size_y",
             "num_trees",
-            "postprocess",
-            "postprocess_allow",
             "legend_style",
         ]
         meta.append(meta_headers)
